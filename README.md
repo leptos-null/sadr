@@ -1,6 +1,6 @@
 # sadr
 
-A Discord bot that replies to `@mention`s in guild channels and to any message in a DM, using the Gemini API. Runs as a single Cloudflare Worker with a Durable Object holding a persistent Gateway connection (not slash commands / Interactions).
+A Discord bot that replies to `@mention`s in servers and to any message in a DM, using the Gemini API. Runs as a single Cloudflare Worker with a Durable Object holding a persistent Gateway connection (not slash commands / Interactions).
 
 ## How it works
 
@@ -10,6 +10,12 @@ A Discord bot that replies to `@mention`s in guild channels and to any message i
 - A self-rescheduling Durable Object alarm keeps the Gateway connection alive indefinitely (an outbound WebSocket alone only keeps a DO alive for 15 minutes).
 
 See `CLAUDE.md` for the full architecture writeup.
+
+## AI Disclaimer
+
+Nearly all of the code in this repo was written by Claude. I make an effort to set the author accurately for each git commit, to reflect who wrote the code.
+
+I still reviewed and oversaw the development, including making architectural decisions.
 
 ## Setup
 
