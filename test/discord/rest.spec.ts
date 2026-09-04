@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage } from "../../src/discord/rest";
+import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage, triggerTyping } from "../../src/discord/rest";
 
 describe("getGatewayBotUrl", () => {
 	afterEach(() => {
@@ -163,6 +163,30 @@ describe("rate limit retries", () => {
 
 		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/429/);
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("triggerTyping", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("posts to the channel's typing endpoint with bot auth", async () => {
+		env.DISCORD_TOKEN = "test-discord-token";
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+
+		await triggerTyping(env, "123");
+
+		const [requestUrl, init] = fetchSpy.mock.calls[0];
+		expect(requestUrl).toBe("https://discord.com/api/v10/channels/123/typing");
+		expect(init?.method).toBe("POST");
+		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
+	});
+
+	it("throws with response detail on failure", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
+
+		await expect(triggerTyping(env, "123")).rejects.toThrow(/401/);
 	});
 });
 

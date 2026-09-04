@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage } from "./discord/rest";
+import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage, triggerTyping } from "./discord/rest";
 import { isAddressedToBot } from "./discord/mentions";
 import {
 	GatewayOpcode,
@@ -29,6 +29,10 @@ const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 // a self-rescheduling alarm (comfortably under 70s, with margin) keeps the DO — and therefore the
 // connection — alive indefinitely.
 const KEEPALIVE_INTERVAL_MS = 60_000;
+
+// Discord's typing indicator only lasts ~10s; refreshed comfortably before it expires so it stays
+// up for the whole time a reply is being generated (generateReply can take multiple Gemini calls).
+const TYPING_REFRESH_MS = 8_000;
 
 /** Sent to the user when generating or delivering a real reply failed — silence is worse. */
 const FALLBACK_REPLY = "Sorry — something went wrong while I was working on a reply. Mind trying again?";
@@ -210,6 +214,7 @@ export class DiscordGateway extends DurableObject<Env> {
 				}
 				if (!isAddressedToBot(message, this.botUserId)) return;
 				debugLog(this.env, () => `Gateway: received message '${message.content}'`);
+				const stopTyping = this.startTyping(message.channel_id);
 				try {
 					const reply = await generateReply(
 						this.env,
@@ -230,10 +235,27 @@ export class DiscordGateway extends DurableObject<Env> {
 					await sendMessage(this.env, message.channel_id, FALLBACK_REPLY, message.id).catch((fallbackError) =>
 						console.error(`Gateway: fallback reply also failed: ${errorMessage(fallbackError)}`, fallbackError),
 					);
+				} finally {
+					stopTyping();
 				}
 				break;
 			}
 		}
+	}
+
+	/**
+	 * Starts Discord's typing indicator and keeps refreshing it until the returned callback is
+	 * called. A single failed refresh is logged and skipped rather than aborting the loop — the next
+	 * tick tries again, and a reply is still coming either way.
+	 */
+	private startTyping(channelId: string): () => void {
+		const fire = () =>
+			triggerTyping(this.env, channelId).catch((error) =>
+				console.warn(`Gateway: typing indicator failed: ${errorMessage(error)}`),
+			);
+		fire();
+		const intervalId = setInterval(fire, TYPING_REFRESH_MS);
+		return () => clearInterval(intervalId);
 	}
 
 	private async identifyOrResume(): Promise<void> {

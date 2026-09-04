@@ -129,6 +129,11 @@ export async function sendMessage(
 	debugLog(env, () => `Discord REST: response ${response.status}`);
 }
 
+/** Triggers Discord's typing indicator in a channel; it shows for ~10s or until a message is sent. */
+export async function triggerTyping(env: Env, channelId: string): Promise<void> {
+	await discordFetch(env, "POST", `/channels/${channelId}/typing`);
+}
+
 /** Fetches messages from a channel around a given message id (both earlier and later messages). */
 export function getChannelMessages(
 	env: Env,
