@@ -161,7 +161,7 @@ async function callGemini(
 			"Content-Type": "application/json",
 		},
 		body: JSON.stringify(requestBody),
-		signal: AbortSignal.timeout(15_000),
+		signal: AbortSignal.timeout(60_000),
 	});
 	if (!response.ok) {
 		throw new Error(`Gemini generateContent failed: ${response.status} ${await response.text()}`);
