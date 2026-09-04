@@ -8,7 +8,7 @@ const MAX_GEMINI_CALLS = 6;
 /** Discord splits this roughly evenly before/after the anchor message. */
 const AROUND_FETCH_LIMIT = 10;
 /**
- * Discord's hard cap on message content. Not enforced locally: the model is asked to stay under it,
+ * Discord's hard cap on message content. Not enforced locally: the model is asked to stay within it,
  * and anything longer is rejected by Discord as a failed send.
  */
 const MAX_REPLY_LENGTH = 2000;
@@ -80,7 +80,10 @@ const sendReplyDeclaration = {
 		properties: {
 			content: {
 				type: "string",
-				description: `Your reply text. Must be under ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages.`,
+				// Schema's int64-format fields are strings in the JSON representation, per
+				// <https://ai.google.dev/api/generate-content#schema>.
+				maxLength: String(MAX_REPLY_LENGTH),
+				description: `Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages.`,
 			},
 			replyToMessageId: {
 				type: "string",
