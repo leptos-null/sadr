@@ -207,6 +207,21 @@ describe("generateReply", () => {
 		expect(fetchSpy).toHaveBeenCalledTimes(6); // MAX_GEMINI_CALLS
 	});
 
+	it("withholds fetch_message_history on the final call, forcing a conclusion", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow();
+
+		const finalCallBody = JSON.parse(fetchSpy.mock.calls[5][1]?.body as string);
+		expect(finalCallBody.tools[0].functionDeclarations.map((d: { name: string }) => d.name)).toEqual(["send_reply"]);
+		// The final-call system instruction shouldn't reference a tool it never declares.
+		const instructionText = finalCallBody.systemInstruction.parts.map((p: { text: string }) => p.text).join(" ");
+		expect(instructionText).not.toContain("fetch_message_history");
+	});
+
 	it("throws when the model doesn't call a function", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(textResponse("no function call"));
 

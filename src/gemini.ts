@@ -82,32 +82,47 @@ const sendReplyDeclaration = {
 	},
 };
 
-function buildSystemInstruction(botUserId: string, botUsername: string): { parts: Array<{ text: string }> } {
+function buildSystemInstruction(
+	botUserId: string,
+	botUsername: string,
+	includeFetchTool: boolean,
+): { parts: Array<{ text: string }> } {
+	const fetchGuidance = includeFetchTool
+		? `If that context isn't enough to reply well, call ${FETCH_HISTORY_FUNCTION} to pull in nearby messages — e.g. a replyToId you want to see, or more context around trigger.id. Newly fetched messages are merged into "messages" on your next turn.\n\nOnce you have enough context, call ${SEND_REPLY_FUNCTION} with your reply text. Reply naturally and concisely.`
+		: `Call ${SEND_REPLY_FUNCTION} with your reply text. Reply naturally and concisely.`;
+
 	return {
 		parts: [
 			{
 				text: `You are a Discord bot named "${botUsername}" (your Discord user id is "${botUserId}"), replying to messages. Every response you give must be a function call.
 
-You're given JSON of the shape {"trigger", "messages"}. "trigger" is the complete message that addressed you — that is what you're responding to, regardless of anything else in "messages". "messages" is every message currently known to you (including trigger itself), in chronological order, each shaped {"id", "user", "userId", "content", "date", "replyToId"}. replyToId is set when a message is itself a Discord reply to another message. If a message's "userId" is "${botUserId}", that's a message you sent yourself. Message content may contain raw Discord mention tokens like <@userId> or <@!userId> — cross-reference the id against "userId" in "messages" to know who's being mentioned.
-
-If that context isn't enough to reply well, call ${FETCH_HISTORY_FUNCTION} to pull in nearby messages — e.g. a replyToId you want to see, or more context around trigger.id. Newly fetched messages are merged into "messages" on your next turn.
-
-Once you have enough context, call ${SEND_REPLY_FUNCTION} with your reply text. Reply naturally and concisely.`,
+You're given JSON of the shape {"trigger", "messages"}. "trigger" is the complete message that addressed you — that is what you're responding to, regardless of anything else in "messages". "messages" is every message currently known to you (including trigger itself), in chronological order, each shaped {"id", "user", "userId", "content", "date", "replyToId"}. replyToId is set when a message is itself a Discord reply to another message. If a message's "userId" is "${botUserId}", that's a message you sent yourself. Message content may contain raw Discord mention tokens like <@userId> or <@!userId> — cross-reference the id against "userId" in "messages" to know who's being mentioned.`,
 			},
+			{ text: fetchGuidance },
 		],
 	};
 }
 
-/** Every call has the same shape — both tools are always offered, and the model must always call one. */
+/**
+ * Every call forces a function call via `mode: "ANY"`. `includeFetchTool` is false only for the
+ * final allowed call — with `fetch_message_history` not even offered (and the system instruction
+ * adjusted to match), `send_reply` is the only function left to call, guaranteeing the model
+ * concludes instead of looping on fetches forever.
+ */
 async function callGemini(
 	env: Env,
 	contents: Content[],
-	systemInstruction: { parts: Array<{ text: string }> },
+	botUserId: string,
+	botUsername: string,
+	includeFetchTool: boolean,
 ): Promise<Content> {
+	const functionDeclarations = includeFetchTool
+		? [fetchHistoryDeclaration, sendReplyDeclaration]
+		: [sendReplyDeclaration];
 	const requestBody: GenerateContentRequest = {
 		contents,
-		systemInstruction,
-		tools: [{ functionDeclarations: [fetchHistoryDeclaration, sendReplyDeclaration] }],
+		systemInstruction: buildSystemInstruction(botUserId, botUsername, includeFetchTool),
+		tools: [{ functionDeclarations }],
 		toolConfig: { functionCallingConfig: { mode: "ANY" } },
 	};
 	debugLog(env, () => `Gemini: request ${JSON.stringify(requestBody)}`);
@@ -144,7 +159,9 @@ function buildContents(trigger: HistoryMessage, resolved: Map<string, HistoryMes
  * Generates a reply to `trigger`. The model calls `fetch_message_history` (around a message id) to
  * pull in more context and `send_reply` once ready; fetched messages accumulate in a resolved map
  * keyed by id, and each Gemini call is given a freshly rebuilt, deduped, chronological view of that
- * map rather than an ever-growing transcript of past tool calls.
+ * map rather than an ever-growing transcript of past tool calls. `fetch_message_history` is
+ * withheld on the final allowed call, forcing the model to conclude with `send_reply` rather than
+ * looping on fetches and never answering.
  */
 export async function generateReply(
 	env: Env,
@@ -154,10 +171,10 @@ export async function generateReply(
 	fetchAround: (messageId: string, limit: number) => Promise<HistoryMessage[]>,
 ): Promise<ReplyResult> {
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
-	const systemInstruction = buildSystemInstruction(botUserId, botUsername);
 
 	for (let call = 0; call < MAX_GEMINI_CALLS; call++) {
-		const modelTurn = await callGemini(env, buildContents(trigger, resolved), systemInstruction);
+		const isLastCall = call === MAX_GEMINI_CALLS - 1;
+		const modelTurn = await callGemini(env, buildContents(trigger, resolved), botUserId, botUsername, !isLastCall);
 
 		const functionCall = modelTurn.parts.find((part) => part.functionCall)?.functionCall;
 		if (!functionCall) {
@@ -189,5 +206,8 @@ export async function generateReply(
 		}
 	}
 
+	// Unreachable in practice: the final call only offers send_reply, so mode "ANY" forces the model
+	// to call it. Kept as a defensive fallback (and to satisfy the return type) in case that ever
+	// stops holding true.
 	throw new Error(`Gemini exceeded ${MAX_GEMINI_CALLS} calls without calling ${SEND_REPLY_FUNCTION}`);
 }
