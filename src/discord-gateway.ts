@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { getGatewayBotUrl, sendMessage } from "./discord/rest";
-import { mentionsUser, stripMention } from "./discord/mentions";
+import { isAddressedToBot, stripMention } from "./discord/mentions";
 import {
 	GatewayOpcode,
 	type GatewayPayload,
@@ -13,9 +13,10 @@ import {
 import { generateReply } from "./gemini";
 import { isDebugEnabled } from "./log-level";
 
-// GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9): enough to receive MESSAGE_CREATE in guilds
-// without requesting the privileged MESSAGE_CONTENT intent (mentions include content regardless).
-const INTENTS = 1 | (1 << 9);
+// GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12): enough to receive
+// MESSAGE_CREATE for guild mentions and DMs, without requesting the privileged MESSAGE_CONTENT
+// intent (mentions and DMs both include content regardless).
+const INTENTS = 1 | (1 << 9) | (1 << 12);
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
@@ -156,7 +157,7 @@ export class DiscordGateway extends DurableObject<Env> {
 					console.warn("Gateway: MESSAGE_CREATE before READY (no bot user id yet), skipping");
 					return;
 				}
-				if (!mentionsUser(message, this.botUserId)) return;
+				if (!isAddressedToBot(message, this.botUserId)) return;
 				console.log(`Gateway: received message: ${message.content.length} chars`);
 				const prompt = stripMention(message.content, this.botUserId);
 				if (!prompt) {

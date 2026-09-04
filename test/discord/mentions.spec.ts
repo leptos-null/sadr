@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { mentionsUser, stripMention } from "../../src/discord/mentions";
+import { isAddressedToBot, mentionsUser, stripMention } from "../../src/discord/mentions";
 import type { MessageCreateDispatchData } from "../../src/discord/gateway-types";
 
 const BOT_ID = "42";
@@ -22,6 +22,20 @@ describe("mentionsUser", () => {
 
 	it("is false when the given user id is not mentioned", () => {
 		expect(mentionsUser(message({ mentions: [{ id: "someone-else" }] }), BOT_ID)).toBe(false);
+	});
+});
+
+describe("isAddressedToBot", () => {
+	it("is true for any DM (no guild_id), even without a mention", () => {
+		expect(isAddressedToBot(message({ guild_id: undefined, mentions: [] }), BOT_ID)).toBe(true);
+	});
+
+	it("is true for a guild message that mentions the bot", () => {
+		expect(isAddressedToBot(message({ guild_id: "guild", mentions: [{ id: BOT_ID }] }), BOT_ID)).toBe(true);
+	});
+
+	it("is false for a guild message that doesn't mention the bot", () => {
+		expect(isAddressedToBot(message({ guild_id: "guild", mentions: [] }), BOT_ID)).toBe(false);
 	});
 });
 

@@ -29,16 +29,17 @@ Package manager is **bun** (`bun.lock` is the lockfile — don't use npm/yarn).
 
 ## Architecture
 
-sadr is a Discord bot that replies to `@mention`s using the Gemini API, running as a single Cloudflare Worker.
+sadr is a Discord bot that replies to `@mention`s in guild channels and to any message in a DM, using the Gemini API, running as a single Cloudflare Worker.
 
 **Gateway connection, not Interactions webhooks.** The bot holds a persistent outbound WebSocket to Discord's Gateway rather than registering slash commands / an HTTP interactions endpoint. This is a deliberate choice (free-text mention chat needs the Gateway; Interactions only supports slash commands) — don't reach for slash commands without revisiting that decision.
 
 - `src/index.ts` — the Worker entry. Re-exports the `DiscordGateway` Durable Object class (required for `wrangler.jsonc`'s `exports` binding) and defines `fetch`/`scheduled`. Both handlers just call `ensureConnected()` on the **one** singleton DO instance (`env.DISCORD_GATEWAY.getByName("default")`) — `fetch` is a health check that fires it via `ctx.waitUntil()` without blocking the response, `scheduled` (5-min cron) awaits it directly as a self-heal in case the socket dropped.
 - `src/discord-gateway.ts` — the `DiscordGateway` DO. This is where almost all the bot logic lives: raw Discord Gateway protocol handling (HELLO → IDENTIFY/RESUME → heartbeat loop → dispatch events), session state (`sessionId`/`resumeGatewayUrl`/`sequence`/`botUserId`) persisted to DO storage so a restart can RESUME instead of re-IDENTIFY, and the `MESSAGE_CREATE` → mention check → Gemini → Discord REST reply pipeline. Logs at each lifecycle step (connect, Hello, READY, close code/reason, mention handling) — check these first when the bot isn't responding.
   - The outbound socket is a plain `new WebSocket(url)` client connection. **Do not call `.accept()` on it** — that method is only valid on the server side of a `WebSocketPair()` (an inbound connection a Worker/DO accepts), and throws on a client-constructed socket.
-  - Only responds to messages that `@mention` the bot; does not request the privileged `MESSAGE_CONTENT` intent (Discord includes content on `MESSAGE_CREATE` when the bot is mentioned regardless of that intent).
+  - Responds to guild messages that `@mention` the bot, and to any message in a DM (`isAddressedToBot()` in `src/discord/mentions.ts`, keyed off whether `guild_id` is present on the dispatch). Does not request the privileged `MESSAGE_CONTENT` intent — Discord includes content on `MESSAGE_CREATE` for both mentions and DMs regardless of that intent.
+  - Verbose tracing (raw Gateway payloads) is gated behind `LOG_LEVEL="debug"` (checked via `isDebugEnabled()` in `src/log-level.ts`) through the `debug()` helper — set `LOG_LEVEL="debug"` in `.dev.vars` locally; never in production.
 - `src/discord/rest.ts` — Discord REST v10 calls (bot-token `Authorization` header): fetching the Gateway WSS URL, posting a channel message.
-- `src/discord/mentions.ts` — pure helpers: whether a message mentions a given user id, stripping the mention token from message content.
+- `src/discord/mentions.ts` — pure helpers: whether a message mentions a given user id, whether a message should be treated as addressed to the bot (DM or mention), stripping the mention token from message content.
 - `src/discord/gateway-types.ts` — Gateway payload envelope and opcode types.
 - `src/gemini.ts` — single-turn (no conversation history kept) call to `gemini-3.5-flash-lite`'s `generateContent`.
 - `wrangler.jsonc` — uses the current `exports` field (not the legacy `migrations` array) to declare the `DiscordGateway` DO with the SQLite storage backend, and `secrets.required` to declare `DISCORD_TOKEN`/`GEMINI_API_KEY` (drives both `Env` typing and `wrangler deploy` validation).

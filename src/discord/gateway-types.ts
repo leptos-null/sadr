@@ -54,4 +54,6 @@ export interface MessageCreateDispatchData {
 		bot?: boolean;
 	};
 	mentions: Array<{ id: string }>;
+	/** Present for guild messages; absent for DMs. */
+	guild_id?: string;
 }
