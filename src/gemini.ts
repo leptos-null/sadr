@@ -33,9 +33,14 @@ export interface ReplyResult {
 	replyToMessageId: string | null;
 }
 
+interface FunctionCall {
+	name: string;
+	args?: Record<string, unknown>;
+}
+
 interface ContentPart {
 	text?: string;
-	functionCall?: { name: string; args?: Record<string, unknown> };
+	functionCall?: FunctionCall;
 }
 
 interface Content {
@@ -196,6 +201,24 @@ function buildContents(trigger: HistoryMessage, resolved: Map<string, HistoryMes
 }
 
 /**
+ * Turns `send_reply`'s arguments into the result handed back to the caller, rejecting empty content
+ * and downgrading a reply id the model never actually saw.
+ */
+function toReplyResult(functionCall: FunctionCall, resolved: Map<string, HistoryMessage>): ReplyResult {
+	const args = functionCall.args as { content?: string; replyToMessageId?: string | null } | undefined;
+	// Trimmed, so whitespace-only content is caught here rather than as a 400 from Discord, which
+	// rejects an empty message body.
+	const content = args?.content?.trim();
+	if (!content) {
+		throw new Error(`Gemini called ${SEND_REPLY_FUNCTION} without content: ${JSON.stringify(functionCall)}`);
+	}
+	// Only ever reply to a message id this call actually resolved — never trust an unverified id
+	// straight from the model (hallucinated or misremembered).
+	const replyToMessageId = args?.replyToMessageId && resolved.has(args.replyToMessageId) ? args.replyToMessageId : null;
+	return { content, replyToMessageId };
+}
+
+/**
  * Generates a reply to `trigger`. The model calls `fetch_message_history` (around a message id) to
  * pull in more context and `send_reply` once ready; fetched messages accumulate in a resolved map
  * keyed by id, and each Gemini call is given a freshly rebuilt, deduped, chronological view of that
@@ -218,41 +241,36 @@ export async function generateReply(
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
 		const parts = await callGemini(env, buildContents(trigger, resolved), botUserId, botUsername, gatherTurnsLeft);
 
-		const functionCall = parts.find((part) => part.functionCall)?.functionCall;
-		if (!functionCall) {
+		// Gemini can return several function calls in one candidate, so take every one rather than
+		// the first — dropping the rest would leave the model believing it had asked for context it
+		// never receives, and re-requesting it next turn.
+		const functionCalls = parts.flatMap((part) => (part.functionCall ? [part.functionCall] : []));
+		if (functionCalls.length === 0) {
 			throw new Error(`Gemini didn't call a function despite mode "ANY": ${JSON.stringify(parts)}`);
 		}
 
-		switch (functionCall.name) {
-			case SEND_REPLY_FUNCTION: {
-				const args = functionCall.args as { content?: string; replyToMessageId?: string | null } | undefined;
-				// Trimmed, so whitespace-only content is caught here rather than as a 400 from Discord,
-				// which rejects an empty message body.
-				const content = args?.content?.trim();
-				if (!content) {
-					throw new Error(`Gemini called ${SEND_REPLY_FUNCTION} without content: ${JSON.stringify(functionCall)}`);
-				}
-				// Only ever reply to a message id this call actually resolved — never trust an
-				// unverified id straight from the model (hallucinated or misremembered).
-				const replyToMessageId =
-					args?.replyToMessageId && resolved.has(args.replyToMessageId) ? args.replyToMessageId : null;
-				return { content, replyToMessageId };
-			}
-			case FETCH_HISTORY_FUNCTION: {
-				// `||`, not `??`: also falls back to trigger.id if the model passes an empty string
-				// instead of omitting the argument.
-				const messageId = (functionCall.args?.message_id as string | undefined) || trigger.id;
-				// Re-fetching an anchor can only return what's already in `resolved`, so skip the
-				// Discord round-trip. The final call withholds this tool, so a model that keeps
-				// asking for the same anchor still terminates.
-				if (fetchedAnchors.has(messageId)) break;
-				fetchedAnchors.add(messageId);
-				const around = await fetchAround(messageId, AROUND_FETCH_LIMIT);
-				for (const message of around) resolved.set(message.id, message);
-				break;
-			}
-			default:
-				throw new Error(`Gemini called an unknown function: ${JSON.stringify(functionCall)}`);
+		// send_reply ends the turn, so it wins outright if the model paired it with fetches.
+		const sendReply = functionCalls.find((functionCall) => functionCall.name === SEND_REPLY_FUNCTION);
+		if (sendReply) return toReplyResult(sendReply, resolved);
+
+		// Checked before any fetch runs, so an unrecognised call can't leave a Discord round-trip
+		// behind on its way out.
+		const unknownCall = functionCalls.find((functionCall) => functionCall.name !== FETCH_HISTORY_FUNCTION);
+		if (unknownCall) {
+			throw new Error(`Gemini called an unknown function: ${JSON.stringify(unknownCall)}`);
+		}
+
+		for (const functionCall of functionCalls) {
+			// `||`, not `??`: also falls back to trigger.id if the model passes an empty string
+			// instead of omitting the argument.
+			const messageId = (functionCall.args?.message_id as string | undefined) || trigger.id;
+			// Re-fetching an anchor can only return what's already in `resolved`, so skip the
+			// Discord round-trip. The final call withholds this tool, so a model that keeps
+			// asking for the same anchor still terminates.
+			if (fetchedAnchors.has(messageId)) continue;
+			fetchedAnchors.add(messageId);
+			const around = await fetchAround(messageId, AROUND_FETCH_LIMIT);
+			for (const message of around) resolved.set(message.id, message);
 		}
 	}
 

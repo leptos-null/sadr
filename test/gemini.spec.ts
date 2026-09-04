@@ -20,13 +20,25 @@ function textResponse(text: string): Response {
 	});
 }
 
-function functionCallResponse(name: string, args: Record<string, unknown> = {}): Response {
+/** A single candidate carrying one or more function calls, as Gemini's parallel calling returns. */
+function multiCallResponse(...calls: Array<{ name: string; args?: Record<string, unknown> }>): Response {
 	return new Response(
 		JSON.stringify({
-			candidates: [{ content: { role: "model", parts: [{ functionCall: { name, args } }] } }],
+			candidates: [
+				{
+					content: {
+						role: "model",
+						parts: calls.map(({ name, args = {} }) => ({ functionCall: { name, args } })),
+					},
+				},
+			],
 		}),
 		{ status: 200 },
 	);
+}
+
+function functionCallResponse(name: string, args: Record<string, unknown> = {}): Response {
+	return multiCallResponse({ name, args });
 }
 
 describe("generateReply", () => {
@@ -168,6 +180,39 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledTimes(1);
+	});
+
+	it("honours every anchor when the model asks for several in one turn", async () => {
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				multiCallResponse(
+					{ name: "fetch_message_history", args: { message_id: "77" } },
+					{ name: "fetch_message_history", args: { message_id: "88" } },
+				),
+			)
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+
+		expect(fetchAround).toHaveBeenCalledTimes(2);
+		expect(fetchAround).toHaveBeenCalledWith("77", 10);
+		expect(fetchAround).toHaveBeenCalledWith("88", 10);
+	});
+
+	it("takes send_reply and drops fetches the model paired with it", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			multiCallResponse(
+				{ name: "fetch_message_history", args: { message_id: "77" } },
+				{ name: "send_reply", args: { content: "hi there", replyToMessageId: null } },
+			),
+		);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+
+		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
+		expect(fetchAround).not.toHaveBeenCalled();
 	});
 
 	it("passes through a replyToMessageId that matches a known message id", async () => {
