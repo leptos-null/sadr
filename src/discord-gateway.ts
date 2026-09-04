@@ -13,10 +13,13 @@ import {
 import { generateReply, type HistoryMessage } from "./gemini";
 import { debugLog } from "./log-level";
 
-// GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12): enough to receive
-// MESSAGE_CREATE for guild mentions and DMs, without requesting the privileged MESSAGE_CONTENT
-// intent (mentions and DMs both include content regardless).
-const INTENTS = 1 | (1 << 9) | (1 << 12);
+// GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12) + MESSAGE_CONTENT (1 << 15).
+// MESSAGE_CONTENT is privileged: without it, content/embeds/attachments come back empty for any
+// message that doesn't mention the bot, isn't a DM, and wasn't sent by the bot — which is nearly
+// everything fetch_message_history's `around` fetch pulls in (see gemini.ts). Must also be enabled
+// under the bot's Privileged Gateway Intents in the Discord Developer Portal, or Discord rejects the
+// connection with a non-resumable invalid session.
+const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));

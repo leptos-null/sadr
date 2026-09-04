@@ -1,3 +1,5 @@
+import { debugLog } from "../log-level";
+
 const API_BASE = "https://discord.com/api/v10";
 
 function authHeaders(env: Env): HeadersInit {
@@ -7,17 +9,30 @@ function authHeaders(env: Env): HeadersInit {
 	};
 }
 
-/** Fetches a fresh Gateway WebSocket URL for a new (non-resumed) connection. */
-export async function getGatewayBotUrl(env: Env): Promise<string> {
-	const response = await fetch(`${API_BASE}/gateway/bot`, {
+/**
+ * Makes a Discord REST call with bot auth, logging the request at debug level and throwing with
+ * response detail on failure. `path` is relative to `API_BASE` and should include any query string.
+ */
+async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
+	debugLog(env, () => `Discord REST: ${method} ${path}${body ? ` ${JSON.stringify(body)}` : ""}`);
+	const response = await fetch(`${API_BASE}${path}`, {
+		method,
 		headers: authHeaders(env),
+		body: body ? JSON.stringify(body) : undefined,
 		signal: AbortSignal.timeout(10_000),
 	});
 	if (!response.ok) {
-		throw new Error(`GET /gateway/bot failed: ${response.status} ${await response.text()}`);
+		throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
 	}
-	const { url } = (await response.json()) as { url: string };
-	return url;
+	return response;
+}
+
+/** Fetches a fresh Gateway WebSocket URL for a new (non-resumed) connection. */
+export async function getGatewayBotUrl(env: Env): Promise<string> {
+	const response = await discordFetch(env, "GET", "/gateway/bot");
+	const data = (await response.json()) as { url: string };
+	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	return data.url;
 }
 
 export interface CurrentUser {
@@ -31,14 +46,10 @@ export interface CurrentUser {
  * resumes.
  */
 export async function getCurrentUser(env: Env): Promise<CurrentUser> {
-	const response = await fetch(`${API_BASE}/users/@me`, {
-		headers: authHeaders(env),
-		signal: AbortSignal.timeout(10_000),
-	});
-	if (!response.ok) {
-		throw new Error(`GET /users/@me failed: ${response.status} ${await response.text()}`);
-	}
-	return (await response.json()) as CurrentUser;
+	const response = await discordFetch(env, "GET", "/users/@me");
+	const data = (await response.json()) as CurrentUser;
+	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	return data;
 }
 
 /** Posts a message to a channel as the bot, optionally as a reply to an earlier message. */
@@ -54,15 +65,8 @@ export async function sendMessage(
 		// deleted or the id is otherwise invalid, rather than erroring the whole request.
 		body.message_reference = { message_id: replyToMessageId, fail_if_not_exists: false };
 	}
-	const response = await fetch(`${API_BASE}/channels/${channelId}/messages`, {
-		method: "POST",
-		headers: authHeaders(env),
-		body: JSON.stringify(body),
-		signal: AbortSignal.timeout(10_000),
-	});
-	if (!response.ok) {
-		throw new Error(`POST /channels/${channelId}/messages failed: ${response.status} ${await response.text()}`);
-	}
+	const response = await discordFetch(env, "POST", `/channels/${channelId}/messages`, body);
+	debugLog(env, () => `Discord REST: response ${response.status}`);
 }
 
 export interface ChannelMessage {
@@ -85,12 +89,8 @@ export async function getChannelMessages(
 	options: { around: string; limit?: number },
 ): Promise<ChannelMessage[]> {
 	const params = new URLSearchParams({ around: options.around, limit: String(options.limit ?? 25) });
-	const response = await fetch(`${API_BASE}/channels/${channelId}/messages?${params}`, {
-		headers: authHeaders(env),
-		signal: AbortSignal.timeout(10_000),
-	});
-	if (!response.ok) {
-		throw new Error(`GET /channels/${channelId}/messages failed: ${response.status} ${await response.text()}`);
-	}
-	return (await response.json()) as ChannelMessage[];
+	const response = await discordFetch(env, "GET", `/channels/${channelId}/messages?${params}`);
+	const data = (await response.json()) as ChannelMessage[];
+	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	return data;
 }
