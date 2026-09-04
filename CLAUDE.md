@@ -1,0 +1,46 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Commands
+
+Package manager is **bun** (`bun.lock` is the lockfile — don't use npm/yarn).
+
+- `bun install` — install deps
+- `bun run dev` — `wrangler dev`, local dev server on `http://localhost:8787`
+- `bun run test` — full vitest suite (`@cloudflare/vitest-plugin`, runs in a real Miniflare Workers runtime, not plain Node)
+  - single file: `bunx vitest run test/gemini.spec.ts`
+  - single test: `bunx vitest run -t "test name"`
+- `bunx tsc --noEmit` — typecheck (no package.json script wraps this)
+- `bun run cf-typegen` — `wrangler types`; **re-run after any binding/secret change in `wrangler.jsonc`** to regenerate `worker-configuration.d.ts`
+- `bun run deploy` — `wrangler deploy`
+
+### Local dev gotchas
+
+- Secrets (`DISCORD_TOKEN`, `GEMINI_API_KEY`) come from a git-ignored `.dev.vars` in the repo root, not `wrangler.jsonc`.
+- Nothing auto-triggers the bot's Gateway connection in local dev. Hit `curl localhost:8787` once after starting `wrangler dev` to fire `ensureConnected()`. The cron (`scheduled` handler) doesn't run locally either — trigger it manually with `curl "http://localhost:8787/cdn-cgi/local/scheduled"` if you need to test the self-heal path.
+- Running `wrangler dev` / `vitest` may need a local loopback listener that a process sandbox can block (`EPERM` on `listen`) — that's an environment restriction, not an app bug.
+
+### Cloudflare docs
+
+`AGENTS.md` in this repo instructs: always fetch current Cloudflare docs before touching Workers/Durable Objects code, since platform APIs and limits change (e.g. this project's DO class lifecycle already moved from `migrations` to the newer `exports` field, and new DO namespaces now require the SQLite storage backend). Use the `cloudflare-docs` MCP server (configured in `.mcp.json`), not prior/training knowledge, for anything Workers/DO/KV/R2/D1/Queues/Vectorize/Workers AI/Agents-SDK related.
+
+`docs/` in this repo is a small local mirror of external doc pages (currently Gemini API docs) the user has dropped in deliberately. Treat these as authoritative over general knowledge or other example snippets that conflict with them — e.g. `docs/ai.google.dev/api.md.txt`'s Authentication section (`x-goog-api-key` header) is correct; the `?key=` query-param form shown in some other Gemini doc examples is not what this project uses.
+
+## Architecture
+
+sadr is a Discord bot that replies to `@mention`s using the Gemini API, running as a single Cloudflare Worker.
+
+**Gateway connection, not Interactions webhooks.** The bot holds a persistent outbound WebSocket to Discord's Gateway rather than registering slash commands / an HTTP interactions endpoint. This is a deliberate choice (free-text mention chat needs the Gateway; Interactions only supports slash commands) — don't reach for slash commands without revisiting that decision.
+
+- `src/index.ts` — the Worker entry. Re-exports the `DiscordGateway` Durable Object class (required for `wrangler.jsonc`'s `exports` binding) and defines `fetch`/`scheduled`. Both handlers just call `ensureConnected()` on the **one** singleton DO instance (`env.DISCORD_GATEWAY.getByName("default")`) — `fetch` is a health check that fires it via `ctx.waitUntil()` without blocking the response, `scheduled` (5-min cron) awaits it directly as a self-heal in case the socket dropped.
+- `src/discord-gateway.ts` — the `DiscordGateway` DO. This is where almost all the bot logic lives: raw Discord Gateway protocol handling (HELLO → IDENTIFY/RESUME → heartbeat loop → dispatch events), session state (`sessionId`/`resumeGatewayUrl`/`sequence`/`botUserId`) persisted to DO storage so a restart can RESUME instead of re-IDENTIFY, and the `MESSAGE_CREATE` → mention check → Gemini → Discord REST reply pipeline. Logs at each lifecycle step (connect, Hello, READY, close code/reason, mention handling) — check these first when the bot isn't responding.
+  - The outbound socket is a plain `new WebSocket(url)` client connection. **Do not call `.accept()` on it** — that method is only valid on the server side of a `WebSocketPair()` (an inbound connection a Worker/DO accepts), and throws on a client-constructed socket.
+  - Only responds to messages that `@mention` the bot; does not request the privileged `MESSAGE_CONTENT` intent (Discord includes content on `MESSAGE_CREATE` when the bot is mentioned regardless of that intent).
+- `src/discord/rest.ts` — Discord REST v10 calls (bot-token `Authorization` header): fetching the Gateway WSS URL, posting a channel message.
+- `src/discord/mentions.ts` — pure helpers: whether a message mentions a given user id, stripping the mention token from message content.
+- `src/discord/gateway-types.ts` — Gateway payload envelope and opcode types.
+- `src/gemini.ts` — single-turn (no conversation history kept) call to `gemini-3.5-flash-lite`'s `generateContent`.
+- `wrangler.jsonc` — uses the current `exports` field (not the legacy `migrations` array) to declare the `DiscordGateway` DO with the SQLite storage backend, and `secrets.required` to declare `DISCORD_TOKEN`/`GEMINI_API_KEY` (drives both `Env` typing and `wrangler deploy` validation).
+
+Test coverage is unit-level only (mocked `fetch`, pure logic) for the REST/Gemini/mention helpers and the health-check response; the actual Gateway handshake (IDENTIFY/heartbeat/RESUME) is verified live via `wrangler dev` rather than automated tests.

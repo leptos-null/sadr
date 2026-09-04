@@ -10,7 +10,29 @@
 	"observability": {
 		"enabled": true
 	},
-	"upload_source_maps": true
+	"upload_source_maps": true,
+	/**
+	 * Durable Object class lifecycle
+	 * https://developers.cloudflare.com/durable-objects/reference/durable-objects-migrations/
+	 */
+	"exports": {
+		"DiscordGateway": { "type": "durable-object", "storage": "sqlite" }
+	},
+	/**
+	 * Required secrets (set via `wrangler secret put` / `.dev.vars`)
+	 * https://developers.cloudflare.com/workers/wrangler/configuration/#secrets-configuration-property
+	 */
+	"secrets": {
+		"required": ["DISCORD_TOKEN", "GEMINI_API_KEY"]
+	},
+	/**
+	 * Cron Triggers
+	 * https://developers.cloudflare.com/workers/configuration/cron-triggers/
+	 * Self-heal: nudge the Durable Object to reconnect if its Gateway WebSocket dropped.
+	 */
+	"triggers": {
+		"crons": ["*/5 * * * *"]
+	},
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -22,6 +44,9 @@
 	 * databases, object storage, AI inference, real-time communication and more.
 	 * https://developers.cloudflare.com/workers/runtime-apis/bindings/
 	 */
+	"durable_objects": {
+		"bindings": [{ "name": "DISCORD_GATEWAY", "class_name": "DiscordGateway" }]
+	},
 	/**
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
