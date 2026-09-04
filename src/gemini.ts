@@ -7,6 +7,11 @@ const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_GEMINI_CALLS = 6;
 /** Discord splits this roughly evenly before/after the anchor message. */
 const AROUND_FETCH_LIMIT = 10;
+/**
+ * Discord's hard cap on message content. Not enforced locally: the model is asked to stay under it,
+ * and anything longer is rejected by Discord as a failed send.
+ */
+const MAX_REPLY_LENGTH = 2000;
 
 const FETCH_HISTORY_FUNCTION = "fetch_message_history";
 const SEND_REPLY_FUNCTION = "send_reply";
@@ -35,7 +40,8 @@ interface ContentPart {
 
 interface Content {
 	role: "user" | "model";
-	parts: ContentPart[];
+	/** Optional on responses: Gemini omits it entirely when a candidate is cut short or blocked. */
+	parts?: ContentPart[];
 }
 
 interface GenerateContentRequest {
@@ -46,19 +52,21 @@ interface GenerateContentRequest {
 }
 
 interface GenerateContentResponse {
-	candidates?: Array<{ content?: Content }>;
+	candidates?: Array<{ content?: Content; finishReason?: string }>;
+	promptFeedback?: { blockReason?: string };
 }
 
 const fetchHistoryDeclaration = {
 	name: FETCH_HISTORY_FUNCTION,
 	description:
-		"Fetch nearby messages from this Discord channel around a specific message id — both earlier and later messages. Useful for general context (pass the trigger message's id) or to follow a reply chain (pass a replyToId you want to see in full). Fetched messages are merged into what you already know, so it's safe to call this more than once.",
+		`Fetch up to ${AROUND_FETCH_LIMIT} messages surrounding a message id — both before and after it. ` +
+		`Use it to follow a reply chain, or to widen context around the trigger. Fetch each id at most once.`,
 	parameters: {
 		type: "object",
 		properties: {
 			message_id: {
 				type: "string",
-				description: "Fetch messages from around this message id. Omit to fetch more context around the trigger message.",
+				description: `An id from "messages" to centre the fetch on. Omit to centre on the trigger message.`,
 			},
 		},
 	},
@@ -66,16 +74,20 @@ const fetchHistoryDeclaration = {
 
 const sendReplyDeclaration = {
 	name: SEND_REPLY_FUNCTION,
-	description: "Send your final reply to Discord. Call this once you're ready to answer.",
+	description: "Send your reply to Discord. This ends your turn.",
 	parameters: {
 		type: "object",
 		properties: {
-			content: { type: "string", description: "The reply text to send to Discord." },
+			content: {
+				type: "string",
+				description: `Your reply text. Must be under ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages.`,
+			},
 			replyToMessageId: {
 				type: "string",
 				nullable: true,
 				description:
-					"The id of a specific message to reply to (Discord will show your message as a reply/quote of it) when directly responding to or quoting that message helps disambiguate what you're addressing. Null for a plain message.",
+					`An id from "messages" to quote, when it isn't obvious which message you're answering — Discord ` +
+					`renders your reply attached to it. Null for a plain message. An id not in "messages" is ignored.`,
 			},
 		},
 		required: ["content", "replyToMessageId"],
@@ -85,43 +97,59 @@ const sendReplyDeclaration = {
 function buildSystemInstruction(
 	botUserId: string,
 	botUsername: string,
-	includeFetchTool: boolean,
+	gatherTurnsLeft: number,
 ): { parts: Array<{ text: string }> } {
-	const fetchGuidance = includeFetchTool
-		? `If that context isn't enough to reply well, call ${FETCH_HISTORY_FUNCTION} to pull in nearby messages — e.g. a replyToId you want to see, or more context around trigger.id. Newly fetched messages are merged into "messages" on your next turn.\n\nOnce you have enough context, call ${SEND_REPLY_FUNCTION} with your reply text. Reply naturally and concisely.`
-		: `Call ${SEND_REPLY_FUNCTION} with your reply text. Reply naturally and concisely.`;
+	// The budget counts down per call, so the model is told what it actually has left rather than a
+	// constant it can't act on. At 0 the wording must never name the withheld tool: each call is
+	// stateless, so the model on that call has never seen it declared.
+	let guidance: string;
+	if (gatherTurnsLeft > 0) {
+		const budget =
+			gatherTurnsLeft === 1
+				? "This is your last turn to gather context."
+				: `You have ${gatherTurnsLeft} turns left to gather context.`;
+		guidance = `If "messages" isn't enough to answer, call ${FETCH_HISTORY_FUNCTION} — e.g. on a replyToId you want to see. ${budget} Then answer with ${SEND_REPLY_FUNCTION}. Reply naturally and concisely.`;
+	} else {
+		guidance = `Answer now with ${SEND_REPLY_FUNCTION}. Reply naturally and concisely.`;
+	}
 
 	return {
 		parts: [
 			{
-				text: `You are a Discord bot named "${botUsername}" (your Discord user id is "${botUserId}"), replying to messages. Every response you give must be a function call.
+				text: `You are "${botUsername}", a Discord bot with user id "${botUserId}". Every response must be a function call.
 
-You're given JSON of the shape {"trigger", "messages"}. "trigger" is the complete message that addressed you — that is what you're responding to, regardless of anything else in "messages". "messages" is every message currently known to you (including trigger itself), in chronological order, each shaped {"id", "user", "userId", "content", "date", "replyToId"}. replyToId is set when a message is itself a Discord reply to another message. If a message's "userId" is "${botUserId}", that's a message you sent yourself. Message content may contain raw Discord mention tokens like <@userId> or <@!userId> — cross-reference the id against "userId" in "messages" to know who's being mentioned.`,
+Each turn you receive JSON of the shape {"trigger", "messages"}.
+- "trigger" is the message addressed to you. Reply to it, whatever else "messages" contains.
+- "messages" is every message you currently know, oldest first, including "trigger".
+
+Each message is {"id", "user", "userId", "content", "date", "replyToId"}: "user" is a display name, "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${botUserId}" is one you sent.
+
+"content" may contain raw mention tokens like <@userId> or <@!userId>. Match the id against "userId" in "messages" to see who is meant.`,
 			},
-			{ text: fetchGuidance },
+			{ text: guidance },
 		],
 	};
 }
 
 /**
- * Every call forces a function call via `mode: "ANY"`. `includeFetchTool` is false only for the
- * final allowed call — with `fetch_message_history` not even offered (and the system instruction
- * adjusted to match), `send_reply` is the only function left to call, guaranteeing the model
- * concludes instead of looping on fetches forever.
+ * Every call forces a function call via `mode: "ANY"`. `gatherTurnsLeft` is how many turns still
+ * offer `fetch_message_history`; at 0 it isn't declared at all (and the system instruction adjusts
+ * to match, without naming it), leaving `send_reply` as the only function the model can call — which
+ * is what guarantees it concludes instead of looping on fetches forever. One number drives both the
+ * tool list and the instruction, so they can't disagree.
  */
 async function callGemini(
 	env: Env,
 	contents: Content[],
 	botUserId: string,
 	botUsername: string,
-	includeFetchTool: boolean,
-): Promise<Content> {
-	const functionDeclarations = includeFetchTool
-		? [fetchHistoryDeclaration, sendReplyDeclaration]
-		: [sendReplyDeclaration];
+	gatherTurnsLeft: number,
+): Promise<ContentPart[]> {
+	const functionDeclarations =
+		gatherTurnsLeft > 0 ? [fetchHistoryDeclaration, sendReplyDeclaration] : [sendReplyDeclaration];
 	const requestBody: GenerateContentRequest = {
 		contents,
-		systemInstruction: buildSystemInstruction(botUserId, botUsername, includeFetchTool),
+		systemInstruction: buildSystemInstruction(botUserId, botUsername, gatherTurnsLeft),
 		tools: [{ functionDeclarations }],
 		toolConfig: { functionCallingConfig: { mode: "ANY" } },
 	};
@@ -140,16 +168,25 @@ async function callGemini(
 	}
 	const data = (await response.json()) as GenerateContentResponse;
 	debugLog(env, () => `Gemini: response ${JSON.stringify(data)}`);
-	const content = data.candidates?.[0]?.content;
-	if (!content) {
-		throw new Error(`Gemini generateContent returned no candidate: ${JSON.stringify(data)}`);
+	const candidate = data.candidates?.[0];
+	// A candidate can come back with no parts at all (finishReason MAX_TOKENS/SAFETY/RECITATION, or a
+	// blocked prompt). Naming the reason here is the difference between a diagnosable log line and a
+	// bare TypeError from reading .parts of undefined.
+	if (!candidate?.content?.parts?.length) {
+		throw new Error(
+			`Gemini generateContent returned no content parts ` +
+			`(finishReason: ${candidate?.finishReason ?? "none"}, blockReason: ${data.promptFeedback?.blockReason ?? "none"}): ` +
+			JSON.stringify(data),
+		);
 	}
-	return content;
+	return candidate.content.parts;
 }
 
 /** Builds a single fresh turn reflecting everything currently known — no function-call scaffolding. */
 function buildContents(trigger: HistoryMessage, resolved: Map<string, HistoryMessage>): Content[] {
-	const messages = [...resolved.values()].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+	// Parsed rather than compared as strings, so ordering doesn't depend on Discord rendering every
+	// timestamp at identical precision.
+	const messages = [...resolved.values()].sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
 	// The full trigger message, not just its id — no lookup into a (possibly large) list required
 	// to know what's actually being responded to.
 	return [{ role: "user", parts: [{ text: JSON.stringify({ trigger, messages }) }] }];
@@ -171,32 +208,42 @@ export async function generateReply(
 	fetchAround: (messageId: string, limit: number) => Promise<HistoryMessage[]>,
 ): Promise<ReplyResult> {
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
+	const fetchedAnchors = new Set<string>();
 
 	for (let call = 0; call < MAX_GEMINI_CALLS; call++) {
-		const isLastCall = call === MAX_GEMINI_CALLS - 1;
-		const modelTurn = await callGemini(env, buildContents(trigger, resolved), botUserId, botUsername, !isLastCall);
+		// Hits 0 on the final call, which is what withholds the fetch tool and forces a conclusion.
+		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
+		const parts = await callGemini(env, buildContents(trigger, resolved), botUserId, botUsername, gatherTurnsLeft);
 
-		const functionCall = modelTurn.parts.find((part) => part.functionCall)?.functionCall;
+		const functionCall = parts.find((part) => part.functionCall)?.functionCall;
 		if (!functionCall) {
-			throw new Error(`Gemini didn't call a function despite mode "ANY": ${JSON.stringify(modelTurn)}`);
+			throw new Error(`Gemini didn't call a function despite mode "ANY": ${JSON.stringify(parts)}`);
 		}
 
 		switch (functionCall.name) {
 			case SEND_REPLY_FUNCTION: {
 				const args = functionCall.args as { content?: string; replyToMessageId?: string | null } | undefined;
-				if (!args?.content) {
+				// Trimmed, so whitespace-only content is caught here rather than as a 400 from Discord,
+				// which rejects an empty message body.
+				const content = args?.content?.trim();
+				if (!content) {
 					throw new Error(`Gemini called ${SEND_REPLY_FUNCTION} without content: ${JSON.stringify(functionCall)}`);
 				}
 				// Only ever reply to a message id this call actually resolved — never trust an
 				// unverified id straight from the model (hallucinated or misremembered).
 				const replyToMessageId =
-					args.replyToMessageId && resolved.has(args.replyToMessageId) ? args.replyToMessageId : null;
-				return { content: args.content, replyToMessageId };
+					args?.replyToMessageId && resolved.has(args.replyToMessageId) ? args.replyToMessageId : null;
+				return { content, replyToMessageId };
 			}
 			case FETCH_HISTORY_FUNCTION: {
 				// `||`, not `??`: also falls back to trigger.id if the model passes an empty string
 				// instead of omitting the argument.
 				const messageId = (functionCall.args?.message_id as string | undefined) || trigger.id;
+				// Re-fetching an anchor can only return what's already in `resolved`, so skip the
+				// Discord round-trip. The final call withholds this tool, so a model that keeps
+				// asking for the same anchor still terminates.
+				if (fetchedAnchors.has(messageId)) break;
+				fetchedAnchors.add(messageId);
 				const around = await fetchAround(messageId, AROUND_FETCH_LIMIT);
 				for (const message of around) resolved.set(message.id, message);
 				break;

@@ -10,7 +10,9 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
+import type { DiscordMessage } from "./discord/types";
 import { generateReply, type HistoryMessage } from "./gemini";
+import { delay } from "./delay";
 import { debugLog, errorMessage } from "./log-level";
 
 // GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12) + MESSAGE_CONTENT (1 << 15).
@@ -28,23 +30,11 @@ const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 // connection — alive indefinitely.
 const KEEPALIVE_INTERVAL_MS = 60_000;
 
-function delay(ms: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, ms));
-}
+/** Sent to the user when generating or delivering a real reply failed — silence is worse. */
+const FALLBACK_REPLY = "Sorry — something went wrong while I was working on a reply. Mind trying again?";
 
-/**
- * Shape common to both `MessageCreateDispatchData` (Gateway) and `ChannelMessage` (REST) — enough
- * to build a `HistoryMessage` from either without duplicating the mapping per source.
- */
-interface DiscordMessageLike {
-	id: string;
-	content: string;
-	timestamp: string;
-	author: { id: string; username: string };
-	message_reference?: { message_id?: string };
-}
-
-function toHistoryMessage(message: DiscordMessageLike): HistoryMessage {
+/** Maps either transport's message shape — both extend `DiscordMessage` — to what Gemini is given. */
+function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 	return {
 		id: message.id,
 		user: message.author.username,
@@ -146,7 +136,9 @@ export class DiscordGateway extends DurableObject<Env> {
 	private async handleMessage(event: MessageEvent): Promise<void> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
 		debugLog(this.env, () => `Gateway: recv ${JSON.stringify(payload)}`);
-		if (payload.s !== null) {
+		// `!= null`, not `!== null`: a frame that omits `s` entirely would otherwise set the sequence
+		// to undefined, which then passes identifyOrResume's null check and RESUMEs with seq: undefined.
+		if (payload.s != null) {
 			this.sequence = payload.s;
 			await this.ctx.storage.put("sequence", payload.s);
 		}
@@ -218,18 +210,27 @@ export class DiscordGateway extends DurableObject<Env> {
 				}
 				if (!isAddressedToBot(message, this.botUserId)) return;
 				debugLog(this.env, () => `Gateway: received message '${message.content}'`);
-				const reply = await generateReply(
-					this.env,
-					this.botUserId,
-					this.botUsername,
-					toHistoryMessage(message),
-					async (messageId, limit) => {
-						const around = await getChannelMessages(this.env, message.channel_id, { around: messageId, limit });
-						return around.map(toHistoryMessage);
-					},
-				);
-				console.log(`Gateway: generated reply, sending to channel ${message.channel_id}`);
-				await sendMessage(this.env, message.channel_id, reply.content, reply.replyToMessageId ?? undefined);
+				try {
+					const reply = await generateReply(
+						this.env,
+						this.botUserId,
+						this.botUsername,
+						toHistoryMessage(message),
+						async (messageId, limit) => {
+							const around = await getChannelMessages(this.env, message.channel_id, { around: messageId, limit });
+							return around.map(toHistoryMessage);
+						},
+					);
+					console.log(`Gateway: generated reply, sending to channel ${message.channel_id}`);
+					await sendMessage(this.env, message.channel_id, reply.content, reply.replyToMessageId ?? undefined);
+				} catch (error) {
+					// Whoever addressed the bot can't tell silence from "still thinking", so always say
+					// something back — but never let the fallback's own failure escape past this log.
+					console.error(`Gateway: failed to reply to message ${message.id}: ${errorMessage(error)}`, error);
+					await sendMessage(this.env, message.channel_id, FALLBACK_REPLY, message.id).catch((fallbackError) =>
+						console.error(`Gateway: fallback reply also failed: ${errorMessage(fallbackError)}`, fallbackError),
+					);
+				}
 				break;
 			}
 		}
@@ -263,7 +264,7 @@ export class DiscordGateway extends DurableObject<Env> {
 		this.send({ op: GatewayOpcode.Heartbeat, d: this.sequence });
 	}
 
-	private send(payload: unknown): void {
+	private send(payload: { op: GatewayOpcode; d: unknown }): void {
 		this.ws?.send(JSON.stringify(payload));
 	}
 }

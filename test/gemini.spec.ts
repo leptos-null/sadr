@@ -137,7 +137,7 @@ describe("generateReply", () => {
 	it("dedupes overlapping fetches by message id", async () => {
 		vi.spyOn(globalThis, "fetch")
 			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
-			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "77" }))
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const earlier: HistoryMessage = {
 			id: "0",
@@ -147,14 +147,27 @@ describe("generateReply", () => {
 			date: "2023-12-31T00:00:00.000Z",
 			replyToId: null,
 		};
-		// Same message returned by both fetches.
+		// Same message returned by both (differently anchored) fetches.
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
 		const fetchSpy = vi.mocked(fetch);
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
+		expect(fetchAround).toHaveBeenCalledTimes(2);
 		const thirdBody = JSON.parse(fetchSpy.mock.calls[2][1]?.body as string);
 		expect(JSON.parse(thirdBody.contents[0].parts[0].text).messages).toEqual([earlier, TRIGGER]);
+	});
+
+	it("skips the round-trip when the model re-fetches an anchor it already asked for", async () => {
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "77" }))
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "77" }))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+
+		expect(fetchAround).toHaveBeenCalledTimes(1);
 	});
 
 	it("passes through a replyToMessageId that matches a known message id", async () => {
@@ -222,6 +235,26 @@ describe("generateReply", () => {
 		expect(instructionText).not.toContain("fetch_message_history");
 	});
 
+	it("counts the gathering budget down per call, then drops it once the tool is withheld", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
+
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn().mockResolvedValue([]))).rejects.toThrow();
+
+		const instructionFor = (call: number) =>
+			JSON.parse(fetchSpy.mock.calls[call][1]?.body as string)
+				.systemInstruction.parts.map((part: { text: string }) => part.text)
+				.join(" ");
+
+		// Five gathering turns, not MAX_GEMINI_CALLS: the sixth call only offers send_reply.
+		expect(instructionFor(0)).toContain("You have 5 turns left to gather context");
+		expect(instructionFor(3)).toContain("You have 2 turns left to gather context");
+		expect(instructionFor(4)).toContain("This is your last turn to gather context");
+		expect(instructionFor(5)).toContain("Answer now");
+		expect(instructionFor(5)).not.toContain("gather context");
+	});
+
 	it("throws when the model doesn't call a function", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(textResponse("no function call"));
 
@@ -232,6 +265,40 @@ describe("generateReply", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(functionCallResponse("send_reply", { replyToMessageId: null }));
 
 		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(/without content/);
+	});
+
+	it("treats whitespace-only content as no content, rather than letting Discord reject it", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			functionCallResponse("send_reply", { content: "  \n ", replyToMessageId: null }),
+		);
+
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(/without content/);
+	});
+
+	it("trims the reply content it returns", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			functionCallResponse("send_reply", { content: "  hi there\n", replyToMessageId: null }),
+		);
+
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn());
+
+		expect(reply.content).toBe("hi there");
+	});
+
+	it("names the finish and block reasons when a candidate comes back with no parts", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					candidates: [{ content: { role: "model" }, finishReason: "MAX_TOKENS" }],
+					promptFeedback: { blockReason: "SAFETY" },
+				}),
+				{ status: 200 },
+			),
+		);
+
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(
+			/no content parts.*MAX_TOKENS.*SAFETY/,
+		);
 	});
 
 	it("throws with response detail on failure", async () => {

@@ -1,3 +1,5 @@
+import type { DiscordMessage, DiscordUser } from "./types";
+
 /** Discord Gateway op codes actually used by this bot. */
 export const GatewayOpcode = {
 	Dispatch: 0,
@@ -10,9 +12,12 @@ export const GatewayOpcode = {
 	HeartbeatAck: 11,
 } as const;
 
-export interface GatewayPayload<T = unknown> {
+export type GatewayOpcode = (typeof GatewayOpcode)[keyof typeof GatewayOpcode];
+
+export interface GatewayPayload {
+	/** Deliberately `number`, not `GatewayOpcode`: Discord sends op codes this bot doesn't model. */
 	op: number;
-	d: T;
+	d: unknown;
 	s: number | null;
 	t: string | null;
 }
@@ -40,25 +45,12 @@ export interface ResumeData {
 export interface ReadyDispatchData {
 	session_id: string;
 	resume_gateway_url: string;
-	user: {
-		id: string;
-		username: string;
-	};
+	user: DiscordUser;
 }
 
-export interface MessageCreateDispatchData {
-	id: string;
+export interface MessageCreateDispatchData extends DiscordMessage {
 	channel_id: string;
-	content: string;
-	timestamp: string;
-	author: {
-		id: string;
-		username: string;
-		bot?: boolean;
-	};
 	mentions: Array<{ id: string }>;
 	/** Present for guild messages; absent for DMs. */
 	guild_id?: string;
-	/** Present when this message is a Discord reply to another message. */
-	message_reference?: { message_id?: string };
 }

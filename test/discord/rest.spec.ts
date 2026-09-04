@@ -103,7 +103,10 @@ describe("sendMessage", () => {
 		expect(requestUrl).toBe("https://discord.com/api/v10/channels/123/messages");
 		expect(init?.method).toBe("POST");
 		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
-		expect(JSON.parse(init?.body as string)).toEqual({ content: "hello" });
+		expect(JSON.parse(init?.body as string)).toEqual({
+			content: "hello",
+			allowed_mentions: { parse: ["users"], replied_user: true },
+		});
 	});
 
 	it("includes a message_reference when replying to a message", async () => {
@@ -115,6 +118,7 @@ describe("sendMessage", () => {
 		const [, init] = fetchSpy.mock.calls[0];
 		expect(JSON.parse(init?.body as string)).toEqual({
 			content: "hello",
+			allowed_mentions: { parse: ["users"], replied_user: true },
 			message_reference: { message_id: "999", fail_if_not_exists: false },
 		});
 	});
@@ -123,6 +127,42 @@ describe("sendMessage", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
 
 		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/401/);
+	});
+});
+
+describe("rate limit retries", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("retries a 429 once Discord's short retry-after has elapsed", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(new Response("slow down", { status: 429, headers: { "retry-after": "0.01" } }))
+			.mockResolvedValueOnce(new Response(null, { status: 200 }));
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		await sendMessage(env, "123", "hello");
+
+		expect(fetchSpy).toHaveBeenCalledTimes(2);
+	});
+
+	it("fails rather than retrying instantly on a malformed retry-after", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("slow down", { status: 429, headers: { "retry-after": "" } }));
+
+		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/429/);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("gives up rather than sitting on a long retry-after", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response("slow down", { status: 429, headers: { "retry-after": "600" } }));
+
+		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/429/);
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
 	});
 });
 
@@ -148,18 +188,9 @@ describe("getChannelMessages", () => {
 		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
 	});
 
-	it("defaults the limit to 25 when omitted", async () => {
-		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
-
-		await getChannelMessages(env, "123", { around: "456" });
-
-		const [requestUrl] = fetchSpy.mock.calls[0];
-		expect(requestUrl).toBe("https://discord.com/api/v10/channels/123/messages?around=456&limit=25");
-	});
-
 	it("throws with response detail on failure", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
 
-		await expect(getChannelMessages(env, "123", { around: "456" })).rejects.toThrow(/401/);
+		await expect(getChannelMessages(env, "123", { around: "456", limit: 10 })).rejects.toThrow(/401/);
 	});
 });

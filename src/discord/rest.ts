@@ -1,4 +1,6 @@
+import { delay } from "../delay";
 import { debugLog } from "../log-level";
+import type { DiscordMessage, DiscordUser } from "./types";
 
 const API_BASE = "https://discord.com/api/v10";
 
@@ -7,47 +9,86 @@ const API_BASE = "https://discord.com/api/v10";
 // AbortSignal.timeout should normally allow) actually matters.
 const SLOW_CALL_THRESHOLD_MS = 3_000;
 
-function authHeaders(env: Env): HeadersInit {
-	return {
-		Authorization: `Bot ${env.DISCORD_TOKEN}`,
-		"Content-Type": "application/json",
-	};
+// A 429 is worth waiting out only if Discord says the wait is short — a long (or global) rate limit
+// is better surfaced as a failure than sat on, since the caller is a user waiting on a reply.
+const MAX_RATE_LIMIT_RETRIES = 2;
+const MAX_RATE_LIMIT_WAIT_MS = 2_000;
+
+function authHeaders(env: Env, hasBody: boolean): HeadersInit {
+	const headers: Record<string, string> = { Authorization: `Bot ${env.DISCORD_TOKEN}` };
+	// Only meaningful when there's actually a body to describe.
+	if (hasBody) headers["Content-Type"] = "application/json";
+	return headers;
 }
 
-/**
- * Makes a Discord REST call with bot auth, logging the request at debug level and throwing with
- * response detail on failure. `path` is relative to `API_BASE` and should include any query string.
- */
-async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
-	debugLog(env, () => `Discord REST: ${method} ${path}${body ? ` ${JSON.stringify(body)}` : ""}`);
+/** One request attempt, warning if it took pathologically long. */
+async function sendOnce(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
+	// One predicate for both the header and the payload, so they can't disagree about whether this
+	// request has a body.
+	const hasBody = body !== undefined;
 	const start = Date.now();
 	const response = await fetch(`${API_BASE}${path}`, {
 		method,
-		headers: authHeaders(env),
-		body: body ? JSON.stringify(body) : undefined,
+		headers: authHeaders(env, hasBody),
+		body: hasBody ? JSON.stringify(body) : undefined,
 		signal: AbortSignal.timeout(10_000),
 	});
 	const durationMs = Date.now() - start;
 	if (durationMs > SLOW_CALL_THRESHOLD_MS) {
 		console.warn(`Discord REST: ${method} ${path} took ${durationMs}ms`);
 	}
-	if (!response.ok) {
-		throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
-	}
 	return response;
+}
+
+/**
+ * How long to wait before retrying, or null if this response shouldn't be retried at all — not a
+ * 429, no usable `retry-after` (missing, or a malformed value that `Number()` turns into something
+ * non-positive), or a wait longer than we're willing to sit on.
+ */
+function rateLimitRetryMs(response: Response): number | null {
+	if (response.status !== 429) return null;
+	const header = response.headers.get("retry-after");
+	const waitMs = header === null ? NaN : Math.ceil(Number(header) * 1000);
+	if (!Number.isFinite(waitMs) || waitMs <= 0 || waitMs > MAX_RATE_LIMIT_WAIT_MS) return null;
+	return waitMs;
+}
+
+/**
+ * Makes a Discord REST call with bot auth, logging the request at debug level, retrying a
+ * short-lived 429, and throwing with response detail on failure. `path` is relative to `API_BASE`
+ * and should include any query string.
+ */
+async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
+	debugLog(env, () => `Discord REST: ${method} ${path}${body === undefined ? "" : ` ${JSON.stringify(body)}`}`);
+	// Unbounded on purpose: the retry budget is spent via `attempt` below, and bounding the loop
+	// itself would add a tail the compiler demands but nothing can reach.
+	for (let attempt = 0; ; attempt++) {
+		const response = await sendOnce(env, method, path, body);
+		const retryMs = attempt < MAX_RATE_LIMIT_RETRIES ? rateLimitRetryMs(response) : null;
+		if (retryMs === null) {
+			if (!response.ok) {
+				throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
+			}
+			return response;
+		}
+		// Not debug-gated: like the slow-call warning, being rate limited is worth seeing in production.
+		console.warn(`Discord REST: ${method} ${path} rate limited, retrying in ${retryMs}ms`);
+		await delay(retryMs);
+	}
+}
+
+/** As `discordFetch`, for the endpoints that return a JSON body worth tracing. */
+async function discordJson<T>(env: Env, method: string, path: string, body?: unknown): Promise<T> {
+	const response = await discordFetch(env, method, path, body);
+	const data = (await response.json()) as T;
+	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	return data;
 }
 
 /** Fetches a fresh Gateway WebSocket URL for a new (non-resumed) connection. */
 export async function getGatewayBotUrl(env: Env): Promise<string> {
-	const response = await discordFetch(env, "GET", "/gateway/bot");
-	const data = (await response.json()) as { url: string };
-	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
-	return data.url;
-}
-
-export interface CurrentUser {
-	id: string;
-	username: string;
+	const { url } = await discordJson<{ url: string }>(env, "GET", "/gateway/bot");
+	return url;
 }
 
 /**
@@ -55,21 +96,30 @@ export interface CurrentUser {
  * (which a RESUME never re-sends) — so identity is resolvable even for a session that only ever
  * resumes.
  */
-export async function getCurrentUser(env: Env): Promise<CurrentUser> {
-	const response = await discordFetch(env, "GET", "/users/@me");
-	const data = (await response.json()) as CurrentUser;
-	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
-	return data;
+export function getCurrentUser(env: Env): Promise<DiscordUser> {
+	return discordJson<DiscordUser>(env, "GET", "/users/@me");
 }
 
-/** Posts a message to a channel as the bot, optionally as a reply to an earlier message. */
+/**
+ * Posts a message to a channel as the bot, optionally as a reply to an earlier message. Content
+ * over Discord's 2000-character limit is rejected by Discord; keeping replies short is the model's
+ * job (see gemini.ts's system instruction), and a rejection surfaces as a failed send.
+ */
 export async function sendMessage(
 	env: Env,
 	channelId: string,
 	content: string,
 	replyToMessageId?: string,
 ): Promise<void> {
-	const body: Record<string, unknown> = { content };
+	const body: Record<string, unknown> = {
+		content,
+		// The model is handed raw mention tokens and can echo them back — including an @everyone it
+		// picked up from fetched history. "users" keeps deliberate user pings working while making an
+		// @everyone or role ping impossible to trigger from generated content. replied_user restores
+		// Discord's default-for-replies behaviour, which sending an allowed_mentions object at all
+		// would otherwise turn off.
+		allowed_mentions: { parse: ["users"], replied_user: true },
+	};
 	if (replyToMessageId) {
 		// fail_if_not_exists: false falls back to a plain send if the referenced message was
 		// deleted or the id is otherwise invalid, rather than erroring the whole request.
@@ -79,28 +129,12 @@ export async function sendMessage(
 	debugLog(env, () => `Discord REST: response ${response.status}`);
 }
 
-export interface ChannelMessage {
-	id: string;
-	content: string;
-	timestamp: string;
-	author: {
-		id: string;
-		username: string;
-		bot?: boolean;
-	};
-	/** Present when this message is a Discord reply to another message. */
-	message_reference?: { message_id?: string };
-}
-
 /** Fetches messages from a channel around a given message id (both earlier and later messages). */
-export async function getChannelMessages(
+export function getChannelMessages(
 	env: Env,
 	channelId: string,
-	options: { around: string; limit?: number },
-): Promise<ChannelMessage[]> {
-	const params = new URLSearchParams({ around: options.around, limit: String(options.limit ?? 25) });
-	const response = await discordFetch(env, "GET", `/channels/${channelId}/messages?${params}`);
-	const data = (await response.json()) as ChannelMessage[];
-	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
-	return data;
+	options: { around: string; limit: number },
+): Promise<DiscordMessage[]> {
+	const params = new URLSearchParams({ around: options.around, limit: String(options.limit) });
+	return discordJson<DiscordMessage[]>(env, "GET", `/channels/${channelId}/messages?${params}`);
 }

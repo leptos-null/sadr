@@ -1,7 +1,7 @@
 import type { MessageCreateDispatchData } from "./gateway-types";
 
 /** Whether a message @-mentions the given user id. */
-export function mentionsUser(message: MessageCreateDispatchData, userId: string): boolean {
+function mentionsUser(message: MessageCreateDispatchData, userId: string): boolean {
 	return message.mentions.some((mention) => mention.id === userId);
 }
 
