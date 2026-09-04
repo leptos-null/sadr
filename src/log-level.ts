@@ -17,3 +17,13 @@ export function getLogLevel(env: { LOG_LEVEL: string }): LogLevel {
 export function isDebugEnabled(env: { LOG_LEVEL: string }): boolean {
 	return getLogLevel(env) === LogLevel.Debug;
 }
+
+/**
+ * Verbose, local-only tracing — gated behind LOG_LEVEL="debug" (set via .dev.vars, never in
+ * production). Takes a factory rather than a string so the message is only built when needed.
+ */
+export function debugLog(env: { LOG_LEVEL: string }, messageFactory: () => string): void {
+	if (isDebugEnabled(env)) {
+		console.log(messageFactory());
+	}
+}

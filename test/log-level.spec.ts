@@ -1,5 +1,5 @@
-import { describe, it, expect } from "vitest";
-import { LogLevel, getLogLevel, isDebugEnabled } from "../src/log-level";
+import { describe, it, expect, vi, afterEach } from "vitest";
+import { LogLevel, debugLog, getLogLevel, isDebugEnabled } from "../src/log-level";
 
 describe("getLogLevel", () => {
 	it("returns Debug when LOG_LEVEL is \"debug\"", () => {
@@ -17,5 +17,30 @@ describe("isDebugEnabled", () => {
 	it("is true only when LOG_LEVEL is \"debug\"", () => {
 		expect(isDebugEnabled({ LOG_LEVEL: "debug" })).toBe(true);
 		expect(isDebugEnabled({ LOG_LEVEL: "info" })).toBe(false);
+	});
+});
+
+describe("debugLog", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("logs the factory's message when LOG_LEVEL is debug", () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const messageFactory = vi.fn(() => "hi");
+
+		debugLog({ LOG_LEVEL: "debug" }, messageFactory);
+
+		expect(logSpy).toHaveBeenCalledWith("hi");
+	});
+
+	it("doesn't call the factory (or log) when LOG_LEVEL isn't debug", () => {
+		const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+		const messageFactory = vi.fn(() => "hi");
+
+		debugLog({ LOG_LEVEL: "info" }, messageFactory);
+
+		expect(messageFactory).not.toHaveBeenCalled();
+		expect(logSpy).not.toHaveBeenCalled();
 	});
 });

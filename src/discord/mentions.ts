@@ -10,12 +10,3 @@ export function isAddressedToBot(message: MessageCreateDispatchData, botUserId: 
 	const isDirectMessage = !message.guild_id;
 	return isDirectMessage || mentionsUser(message, botUserId);
 }
-
-/** Strips every `<@id>` / `<@!id>` mention token for the given user id out of the content, trimmed. */
-export function stripMention(content: string, userId: string): string {
-	const pattern = new RegExp(`<@!?${userId}>`, "g");
-	return content
-		.replace(pattern, "")
-		.replace(/\s+/g, " ")
-		.trim();
-}

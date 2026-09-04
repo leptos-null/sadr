@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import { getGatewayBotUrl, sendMessage } from "./discord/rest";
-import { isAddressedToBot, stripMention } from "./discord/mentions";
+import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage } from "./discord/rest";
+import { isAddressedToBot } from "./discord/mentions";
 import {
 	GatewayOpcode,
 	type GatewayPayload,
@@ -10,8 +10,8 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
-import { generateReply } from "./gemini";
-import { isDebugEnabled } from "./log-level";
+import { generateReply, type HistoryMessage } from "./gemini";
+import { debugLog } from "./log-level";
 
 // GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12): enough to receive
 // MESSAGE_CREATE for guild mentions and DMs, without requesting the privileged MESSAGE_CONTENT
@@ -22,6 +22,29 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Shape common to both `MessageCreateDispatchData` (Gateway) and `ChannelMessage` (REST) — enough
+ * to build a `HistoryMessage` from either without duplicating the mapping per source.
+ */
+interface DiscordMessageLike {
+	id: string;
+	content: string;
+	timestamp: string;
+	author: { id: string; username: string };
+	message_reference?: { message_id?: string };
+}
+
+function toHistoryMessage(message: DiscordMessageLike): HistoryMessage {
+	return {
+		id: message.id,
+		user: message.author.username,
+		userId: message.author.id,
+		content: message.content,
+		date: message.timestamp,
+		replyToId: message.message_reference?.message_id ?? null,
+	};
+}
+
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
 	private heartbeatIntervalId?: ReturnType<typeof setInterval>;
@@ -29,6 +52,7 @@ export class DiscordGateway extends DurableObject<Env> {
 	private resumeGatewayUrl?: string;
 	private sequence: number | null = null;
 	private botUserId?: string;
+	private botUsername?: string;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -37,6 +61,7 @@ export class DiscordGateway extends DurableObject<Env> {
 			this.resumeGatewayUrl = await ctx.storage.get<string>("resumeGatewayUrl");
 			this.sequence = (await ctx.storage.get<number>("sequence")) ?? null;
 			this.botUserId = await ctx.storage.get<string>("botUserId");
+			this.botUsername = await ctx.storage.get<string>("botUsername");
 		});
 	}
 
@@ -47,6 +72,14 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private async connectToGateway(): Promise<void> {
+		// A RESUME never triggers a READY dispatch, so a session that only ever resumes (e.g. a DO
+		// restarted after this field was added) would otherwise never learn its own identity.
+		if (!this.botUserId || !this.botUsername) {
+			const me = await getCurrentUser(this.env);
+			this.botUserId = me.id;
+			this.botUsername = me.username;
+			await this.ctx.storage.put({ botUserId: me.id, botUsername: me.username });
+		}
 		const resuming = Boolean(this.resumeGatewayUrl && this.sessionId);
 		const url = resuming ? this.resumeGatewayUrl! : await getGatewayBotUrl(this.env);
 		console.log(`Gateway: connecting (${resuming ? "resume" : "fresh"}) to ${url}`);
@@ -78,19 +111,9 @@ export class DiscordGateway extends DurableObject<Env> {
 		this.ws = undefined;
 	}
 
-	/**
-	 * Verbose, local-only tracing — gated behind LOG_LEVEL="debug" (set via .dev.vars, never in
-	 * production). Takes a factory rather than a string so the message is only built when needed.
-	 */
-	private debug(messageFactory: () => string): void {
-		if (isDebugEnabled(this.env)) {
-			console.log(messageFactory());
-		}
-	}
-
 	private async handleMessage(event: MessageEvent): Promise<void> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
-		this.debug(() => `Gateway: recv ${JSON.stringify(payload)}`);
+		debugLog(this.env, () => `Gateway: recv ${JSON.stringify(payload)}`);
 		if (payload.s !== null) {
 			this.sequence = payload.s;
 			await this.ctx.storage.put("sequence", payload.s);
@@ -143,30 +166,38 @@ export class DiscordGateway extends DurableObject<Env> {
 				this.sessionId = ready.session_id;
 				this.resumeGatewayUrl = ready.resume_gateway_url;
 				this.botUserId = ready.user.id;
+				this.botUsername = ready.user.username;
 				await this.ctx.storage.put({
 					sessionId: ready.session_id,
 					resumeGatewayUrl: ready.resume_gateway_url,
 					botUserId: ready.user.id,
+					botUsername: ready.user.username,
 				});
 				break;
 			}
 			case "MESSAGE_CREATE": {
 				const message = payload.d as MessageCreateDispatchData;
 				if (message.author.bot) return;
-				if (!this.botUserId) {
-					console.warn("Gateway: MESSAGE_CREATE before READY (no bot user id yet), skipping");
+				if (!this.botUserId || !this.botUsername) {
+					// Shouldn't happen in practice — connectToGateway() resolves identity via REST before
+					// the socket even opens — but kept as defense-in-depth.
+					console.warn("Gateway: MESSAGE_CREATE with no bot identity resolved yet, skipping");
 					return;
 				}
 				if (!isAddressedToBot(message, this.botUserId)) return;
-				console.log(`Gateway: received message: ${message.content.length} chars`);
-				const prompt = stripMention(message.content, this.botUserId);
-				if (!prompt) {
-					console.log("Gateway: mention had no content after stripping, skipping");
-					return;
-				}
-				const reply = await generateReply(this.env, prompt);
+				debugLog(this.env, () => `Gateway: received message '${message.content}'`);
+				const reply = await generateReply(
+					this.env,
+					this.botUserId,
+					this.botUsername,
+					toHistoryMessage(message),
+					async (messageId, limit) => {
+						const around = await getChannelMessages(this.env, message.channel_id, { around: messageId, limit });
+						return around.map(toHistoryMessage);
+					},
+				);
 				console.log(`Gateway: generated reply, sending to channel ${message.channel_id}`);
-				await sendMessage(this.env, message.channel_id, reply);
+				await sendMessage(this.env, message.channel_id, reply.content, reply.replyToMessageId ?? undefined);
 				break;
 			}
 		}

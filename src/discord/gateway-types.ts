@@ -42,6 +42,7 @@ export interface ReadyDispatchData {
 	resume_gateway_url: string;
 	user: {
 		id: string;
+		username: string;
 	};
 }
 
@@ -49,11 +50,15 @@ export interface MessageCreateDispatchData {
 	id: string;
 	channel_id: string;
 	content: string;
+	timestamp: string;
 	author: {
 		id: string;
+		username: string;
 		bot?: boolean;
 	};
 	mentions: Array<{ id: string }>;
 	/** Present for guild messages; absent for DMs. */
 	guild_id?: string;
+	/** Present when this message is a Discord reply to another message. */
+	message_reference?: { message_id?: string };
 }
