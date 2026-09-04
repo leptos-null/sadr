@@ -28,6 +28,40 @@ describe("getGatewayBotUrl", () => {
 	});
 });
 
+describe("slow Discord REST call warning", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+		vi.useRealTimers();
+	});
+
+	it("warns (regardless of LOG_LEVEL) when a call exceeds the slow-call threshold", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		// Advance the (fake) clock inside the mocked fetch itself, simulating a slow network call,
+		// rather than trying to time individual Date.now() calls relative to each other.
+		vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
+			vi.advanceTimersByTime(3001);
+			return new Response(JSON.stringify({ url: "wss://gateway.discord.gg" }), { status: 200 });
+		});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		await getGatewayBotUrl(env);
+
+		expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("took 3001ms"));
+	});
+
+	it("doesn't warn for a call under the threshold", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			new Response(JSON.stringify({ url: "wss://gateway.discord.gg" }), { status: 200 }),
+		);
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		await getGatewayBotUrl(env);
+
+		expect(warnSpy).not.toHaveBeenCalled();
+	});
+});
+
 describe("getCurrentUser", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();

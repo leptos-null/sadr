@@ -21,6 +21,13 @@ import { debugLog } from "./log-level";
 // connection with a non-resumable invalid session.
 const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 
+// An outbound connection (our Gateway WebSocket) only keeps a Durable Object alive for a maximum
+// of 15 minutes — after that, the DO is evicted (killing the socket) after 70-140s with no
+// incoming request/RPC/event. The 5-min scheduled cron alone is too infrequent to prevent that, so
+// a self-rescheduling alarm (comfortably under 70s, with margin) keeps the DO — and therefore the
+// connection — alive indefinitely.
+const KEEPALIVE_INTERVAL_MS = 60_000;
+
 function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -70,6 +77,26 @@ export class DiscordGateway extends DurableObject<Env> {
 
 	/** Called by the Worker's fetch/scheduled handlers; connects only if not already connected. */
 	async ensureConnected(): Promise<void> {
+		// Bootstraps (or self-heals) the keep-alive alarm loop — alarm() reschedules itself on every
+		// firing, so this only matters here for the first call ever, or if the alarm was ever lost.
+		if (!(await this.ctx.storage.getAlarm())) {
+			await this.ctx.storage.setAlarm(Date.now() + KEEPALIVE_INTERVAL_MS);
+		}
+		await this.connectIfNeeded();
+	}
+
+	/** Keeps this DO (and its outbound Gateway connection) alive past the 15-min outbound-connection grace period. */
+	async alarm(): Promise<void> {
+		try {
+			await this.connectIfNeeded();
+		} catch (error) {
+			console.error("Gateway: alarm's connect attempt failed", error);
+		} finally {
+			await this.ctx.storage.setAlarm(Date.now() + KEEPALIVE_INTERVAL_MS);
+		}
+	}
+
+	private async connectIfNeeded(): Promise<void> {
 		if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
 		await this.connectToGateway();
 	}

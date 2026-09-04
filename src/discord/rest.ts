@@ -2,6 +2,11 @@ import { debugLog } from "../log-level";
 
 const API_BASE = "https://discord.com/api/v10";
 
+// Not debug-gated: unlike the request/response trace below, this needs to be visible in
+// production, since that's where a pathologically slow call (well past what the 10s
+// AbortSignal.timeout should normally allow) actually matters.
+const SLOW_CALL_THRESHOLD_MS = 3_000;
+
 function authHeaders(env: Env): HeadersInit {
 	return {
 		Authorization: `Bot ${env.DISCORD_TOKEN}`,
@@ -15,12 +20,17 @@ function authHeaders(env: Env): HeadersInit {
  */
 async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
 	debugLog(env, () => `Discord REST: ${method} ${path}${body ? ` ${JSON.stringify(body)}` : ""}`);
+	const start = Date.now();
 	const response = await fetch(`${API_BASE}${path}`, {
 		method,
 		headers: authHeaders(env),
 		body: body ? JSON.stringify(body) : undefined,
 		signal: AbortSignal.timeout(10_000),
 	});
+	const durationMs = Date.now() - start;
+	if (durationMs > SLOW_CALL_THRESHOLD_MS) {
+		console.warn(`Discord REST: ${method} ${path} took ${durationMs}ms`);
+	}
 	if (!response.ok) {
 		throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
 	}
