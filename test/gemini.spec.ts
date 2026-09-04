@@ -51,12 +51,14 @@ describe("generateReply", () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
-		const fetchAround = vi.fn();
+		const fetchAround = vi.fn().mockResolvedValue([]);
 
 		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
-		expect(fetchAround).not.toHaveBeenCalled();
+		// The automatic seed fetch around the trigger, not a model-issued call.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
 		const [requestUrl, init] = fetchSpy.mock.calls[0];
@@ -76,9 +78,9 @@ describe("generateReply", () => {
 		expect(JSON.parse(body.contents[0].parts[0].text)).toEqual({ trigger: TRIGGER, messages: [TRIGGER] });
 	});
 
-	it("fetches history around the trigger by default, then answers with the merged context", async () => {
-		vi.spyOn(globalThis, "fetch")
-			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
+	it("seeds context around the trigger before asking the model anything", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const earlier: HistoryMessage = {
 			id: "0",
@@ -93,13 +95,44 @@ describe("generateReply", () => {
 		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
+		expect(fetchAround).toHaveBeenCalledTimes(1);
 		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
+		// The seeded message actually reached the model on its very first call, not just the fetch itself.
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		expect(JSON.parse(body.contents[0].parts[0].text).messages).toEqual([earlier, TRIGGER]);
 	});
 
-	it("gives the second call a clean, chronologically merged view with no function-call scaffolding", async () => {
+	it("also seeds context around the reply target when the trigger is itself a reply", async () => {
+		const replyTrigger: HistoryMessage = { ...TRIGGER, replyToId: "42" };
+		vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }),
+		);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchAround);
+
+		expect(fetchAround).toHaveBeenCalledTimes(2);
+		expect(fetchAround).toHaveBeenCalledWith(replyTrigger.id, 10);
+		expect(fetchAround).toHaveBeenCalledWith("42", 10);
+	});
+
+	it("treats a model-issued fetch of an already-seeded anchor as a no-op", async () => {
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+
+		// Once for the automatic seed fetch; the model's own (redundant) request for the trigger — via
+		// an omitted message_id, which falls back to it — is deduped rather than fetched again.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+	});
+
+	it("gives the next call a clean, chronologically merged view with no function-call scaffolding", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
-			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "1" }))
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "77" }))
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const earlier: HistoryMessage = {
 			id: "0",
@@ -109,7 +142,9 @@ describe("generateReply", () => {
 			date: "2023-12-31T00:00:00.000Z",
 			replyToId: null,
 		};
-		const fetchAround = vi.fn().mockResolvedValue([earlier]);
+		// Keyed by anchor so the automatic trigger seed comes back empty and only the model's explicit
+		// fetch of "77" brings "earlier" in — isolating what actually changes between the two calls.
+		const fetchAround = vi.fn((anchor: string) => Promise.resolve(anchor === "77" ? [earlier] : []));
 
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
@@ -144,6 +179,9 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
+		// Only the automatic seed fetch — the fallback resolves to an already-seeded anchor, not a
+		// spurious fetch for the literal empty string.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
 	});
 
 	it("dedupes overlapping fetches by message id", async () => {
@@ -179,7 +217,8 @@ describe("generateReply", () => {
 
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
-		expect(fetchAround).toHaveBeenCalledTimes(1);
+		// The automatic seed fetch, plus one for "77" the first time it's asked for — the repeat is deduped.
+		expect(fetchAround).toHaveBeenCalledTimes(2);
 	});
 
 	it("honours every anchor when the model asks for several in one turn", async () => {
@@ -195,7 +234,8 @@ describe("generateReply", () => {
 
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
-		expect(fetchAround).toHaveBeenCalledTimes(2);
+		// The automatic seed fetch, plus "77" and "88".
+		expect(fetchAround).toHaveBeenCalledTimes(3);
 		expect(fetchAround).toHaveBeenCalledWith("77", 10);
 		expect(fetchAround).toHaveBeenCalledWith("88", 10);
 	});
@@ -212,7 +252,9 @@ describe("generateReply", () => {
 		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
-		expect(fetchAround).not.toHaveBeenCalled();
+		// Only the automatic seed fetch — send_reply wins outright, so the paired "77" fetch never runs.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
 	});
 
 	it("passes through a replyToMessageId that matches a known message id", async () => {
@@ -220,7 +262,8 @@ describe("generateReply", () => {
 			functionCallResponse("send_reply", { content: "hi", replyToMessageId: TRIGGER.id }),
 		);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn());
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: TRIGGER.id });
 	});
@@ -230,7 +273,8 @@ describe("generateReply", () => {
 			functionCallResponse("send_reply", { content: "hi", replyToMessageId: "some-unknown-id" }),
 		);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn());
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: null });
 	});
@@ -285,7 +329,8 @@ describe("generateReply", () => {
 			.spyOn(globalThis, "fetch")
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn().mockResolvedValue([]))).rejects.toThrow();
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow();
 
 		const instructionFor = (call: number) =>
 			JSON.parse(fetchSpy.mock.calls[call][1]?.body as string)
@@ -303,13 +348,17 @@ describe("generateReply", () => {
 	it("throws when the model doesn't call a function", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(textResponse("no function call"));
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(/didn't call a function/);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(
+			/didn't call a function/,
+		);
 	});
 
 	it("throws when send_reply is called without content", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(functionCallResponse("send_reply", { replyToMessageId: null }));
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(/without content/);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/without content/);
 	});
 
 	it("treats whitespace-only content as no content, rather than letting Discord reject it", async () => {
@@ -317,7 +366,8 @@ describe("generateReply", () => {
 			functionCallResponse("send_reply", { content: "  \n ", replyToMessageId: null }),
 		);
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(/without content/);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/without content/);
 	});
 
 	it("trims the reply content it returns", async () => {
@@ -325,7 +375,8 @@ describe("generateReply", () => {
 			functionCallResponse("send_reply", { content: "  hi there\n", replyToMessageId: null }),
 		);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn());
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
 
 		expect(reply.content).toBe("hi there");
 	});
@@ -341,7 +392,8 @@ describe("generateReply", () => {
 			),
 		);
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(
 			/no content parts.*MAX_TOKENS.*SAFETY/,
 		);
 	});
@@ -349,6 +401,7 @@ describe("generateReply", () => {
 	it("throws with response detail on failure", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad key", { status: 403 }));
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, vi.fn())).rejects.toThrow(/403/);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/403/);
 	});
 });

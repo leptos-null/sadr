@@ -219,12 +219,15 @@ function toReplyResult(functionCall: FunctionCall, resolved: Map<string, History
 }
 
 /**
- * Generates a reply to `trigger`. The model calls `fetch_message_history` (around a message id) to
- * pull in more context and `send_reply` once ready; fetched messages accumulate in a resolved map
- * keyed by id, and each Gemini call is given a freshly rebuilt, deduped, chronological view of that
- * map rather than an ever-growing transcript of past tool calls. `fetch_message_history` is
- * withheld on the final allowed call, forcing the model to conclude with `send_reply` rather than
- * looping on fetches and never answering.
+ * Generates a reply to `trigger`. Before asking the model anything, the messages surrounding the
+ * trigger — and, if the trigger is itself a reply, the messages surrounding whatever it's replying
+ * to — are fetched and seeded into context: the two things a model would almost always ask for
+ * anyway, done up front instead of costing it a turn. From there the model can still call
+ * `fetch_message_history` (around a message id) to pull in further context and `send_reply` once
+ * ready; fetched messages accumulate in a resolved map keyed by id, and each Gemini call is given a
+ * freshly rebuilt, deduped, chronological view of that map rather than an ever-growing transcript of
+ * past tool calls. `fetch_message_history` is withheld on the final allowed call, forcing the model
+ * to conclude with `send_reply` rather than looping on fetches and never answering.
  */
 export async function generateReply(
 	env: Env,
@@ -235,6 +238,15 @@ export async function generateReply(
 ): Promise<ReplyResult> {
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
 	const fetchedAnchors = new Set<string>();
+
+	// Seed the two anchors a model would almost always fetch anyway
+	const seedAnchors = trigger.replyToId ? [trigger.id, trigger.replyToId] : [trigger.id];
+	for (const anchor of seedAnchors) fetchedAnchors.add(anchor);
+
+	const seeded = await Promise.all(seedAnchors.map((anchor) => fetchAround(anchor, AROUND_FETCH_LIMIT)));
+	for (const around of seeded) {
+		for (const message of around) resolved.set(message.id, message);
+	}
 
 	for (let call = 0; call < MAX_GEMINI_CALLS; call++) {
 		// Hits 0 on the final call, which is what withholds the fetch tool and forces a conclusion.
