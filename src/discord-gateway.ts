@@ -11,6 +11,7 @@ import {
 	type ResumeData,
 } from "./discord/gateway-types";
 import { generateReply } from "./gemini";
+import { isDebugEnabled } from "./log-level";
 
 // GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9): enough to receive MESSAGE_CREATE in guilds
 // without requesting the privileged MESSAGE_CONTENT intent (mentions include content regardless).
@@ -76,8 +77,19 @@ export class DiscordGateway extends DurableObject<Env> {
 		this.ws = undefined;
 	}
 
+	/**
+	 * Verbose, local-only tracing — gated behind LOG_LEVEL="debug" (set via .dev.vars, never in
+	 * production). Takes a factory rather than a string so the message is only built when needed.
+	 */
+	private debug(messageFactory: () => string): void {
+		if (isDebugEnabled(this.env)) {
+			console.log(messageFactory());
+		}
+	}
+
 	private async handleMessage(event: MessageEvent): Promise<void> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
+		this.debug(() => `Gateway: recv ${JSON.stringify(payload)}`);
 		if (payload.s !== null) {
 			this.sequence = payload.s;
 			await this.ctx.storage.put("sequence", payload.s);
