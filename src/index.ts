@@ -1,3 +1,5 @@
+import { errorMessage } from "./log-level";
+
 export { DiscordGateway } from "./discord-gateway";
 
 function gateway(env: Env) {
@@ -7,7 +9,11 @@ function gateway(env: Env) {
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
 		// Health check: nudge the gateway without making the response wait on it.
-		ctx.waitUntil(gateway(env).ensureConnected().catch((error) => console.error("ensureConnected failed", error)));
+		ctx.waitUntil(
+			gateway(env)
+				.ensureConnected()
+				.catch((error) => console.error(`ensureConnected failed: ${errorMessage(error)}`, error)),
+		);
 		return new Response("ok");
 	},
 

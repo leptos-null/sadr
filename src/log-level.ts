@@ -27,3 +27,12 @@ export function debugLog(env: { LOG_LEVEL: string }, messageFactory: () => strin
 		console.log(messageFactory());
 	}
 }
+
+/**
+ * Extracts a displayable message from a caught value, for embedding directly in a log line's
+ * text rather than passing the error as a separate console.error argument — Cloudflare's log
+ * capture doesn't reliably surface an Error's own message that way, only its stack frames.
+ */
+export function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { LogLevel, debugLog, getLogLevel, isDebugEnabled } from "../src/log-level";
+import { LogLevel, debugLog, errorMessage, getLogLevel, isDebugEnabled } from "../src/log-level";
 
 describe("getLogLevel", () => {
 	it("returns Debug when LOG_LEVEL is \"debug\"", () => {
@@ -42,5 +42,16 @@ describe("debugLog", () => {
 
 		expect(messageFactory).not.toHaveBeenCalled();
 		expect(logSpy).not.toHaveBeenCalled();
+	});
+});
+
+describe("errorMessage", () => {
+	it("extracts the message from an Error", () => {
+		expect(errorMessage(new Error("boom"))).toBe("boom");
+	});
+
+	it("stringifies a non-Error value", () => {
+		expect(errorMessage("boom")).toBe("boom");
+		expect(errorMessage(42)).toBe("42");
 	});
 });

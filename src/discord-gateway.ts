@@ -11,7 +11,7 @@ import {
 	type ResumeData,
 } from "./discord/gateway-types";
 import { generateReply, type HistoryMessage } from "./gemini";
-import { debugLog } from "./log-level";
+import { debugLog, errorMessage } from "./log-level";
 
 // GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12) + MESSAGE_CONTENT (1 << 15).
 // MESSAGE_CONTENT is privileged: without it, content/embeds/attachments come back empty for any
@@ -90,7 +90,7 @@ export class DiscordGateway extends DurableObject<Env> {
 		try {
 			await this.connectIfNeeded();
 		} catch (error) {
-			console.error("Gateway: alarm's connect attempt failed", error);
+			console.error(`Gateway: alarm's connect attempt failed: ${errorMessage(error)}`, error);
 		} finally {
 			await this.ctx.storage.setAlarm(Date.now() + KEEPALIVE_INTERVAL_MS);
 		}
@@ -118,7 +118,9 @@ export class DiscordGateway extends DurableObject<Env> {
 		// (e.g. the old socket's belated "close" after a Reconnect already opened a new one).
 		ws.addEventListener("message", (event) => {
 			if (this.ws !== ws) return;
-			this.handleMessage(event).catch((error) => console.error("Gateway: error handling message", error));
+			this.handleMessage(event).catch((error) =>
+				console.error(`Gateway: error handling message: ${errorMessage(error)}`, error),
+			);
 		});
 		ws.addEventListener("close", (event) => {
 			if (this.ws !== ws) return;
