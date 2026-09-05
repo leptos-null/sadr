@@ -88,7 +88,9 @@ const sendReplyDeclaration = {
 				// Schema's int64-format fields are strings in the JSON representation, per
 				// <https://ai.google.dev/api/generate-content#schema>.
 				maxLength: String(MAX_REPLY_LENGTH),
-				description: `Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages.`,
+				description:
+					`Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages. ` +
+					`For a line break, use an actual newline character — not the two-character sequence "\\n".`,
 			},
 			replyToMessageId: {
 				type: "string",
