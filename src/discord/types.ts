@@ -11,6 +11,15 @@ export interface DiscordUser {
 	bot?: boolean;
 }
 
+/** <https://docs.discord.com/developers/resources/channel#channel-object>; only the fields this bot reads. */
+export interface DiscordChannel {
+	id: string;
+	/** Absent for a DM channel; present (though possibly null) for a guild channel or group DM. */
+	name?: string | null;
+	/** Only guild text/announcement/forum/media channels carry this; absent for DMs, and possibly null if unset. */
+	topic?: string | null;
+}
+
 export interface DiscordMessage {
 	id: string;
 	content: string;

@@ -1,5 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage, triggerTyping } from "./discord/rest";
+import {
+	getChannel,
+	getChannelMessages,
+	getCurrentUser,
+	getGatewayBotUrl,
+	sendMessage,
+	triggerTyping,
+} from "./discord/rest";
 import { isAddressedToBot } from "./discord/mentions";
 import {
 	GatewayOpcode,
@@ -10,8 +17,8 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
-import type { DiscordMessage } from "./discord/types";
-import { generateReply, type HistoryMessage } from "./gemini";
+import type { DiscordChannel, DiscordMessage } from "./discord/types";
+import { generateReply, type ChannelInfo, type HistoryMessage } from "./gemini";
 import { delay } from "./delay";
 import { debugLog, errorMessage } from "./log-level";
 
@@ -47,6 +54,11 @@ function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 		date: message.timestamp,
 		replyToId: message.message_reference?.message_id ?? null,
 	};
+}
+
+/** As `toHistoryMessage`, for the channel metadata Gemini is given. */
+function toChannelInfo(channel: DiscordChannel): ChannelInfo {
+	return { name: channel.name ?? null, topic: channel.topic ?? null };
 }
 
 export class DiscordGateway extends DurableObject<Env> {
@@ -221,6 +233,12 @@ export class DiscordGateway extends DurableObject<Env> {
 						this.botUserId,
 						this.botUsername,
 						toHistoryMessage(message),
+						// A DM channel never carries a name/topic, so skip the REST round-trip entirely for one —
+						// guild_id's absence is the same DM check mentions.ts's isAddressedToBot relies on.
+						async () =>
+							message.guild_id
+								? toChannelInfo(await getChannel(this.env, message.channel_id))
+								: { name: null, topic: null },
 						async (messageId, limit) => {
 							const around = await getChannelMessages(this.env, message.channel_id, { around: messageId, limit });
 							return around.map(toHistoryMessage);

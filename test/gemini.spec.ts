@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { generateReply, type HistoryMessage } from "../src/gemini";
+import { generateReply, type ChannelInfo, type HistoryMessage } from "../src/gemini";
 
 const BOT_USER_ID = "999";
 const BOT_USERNAME = "sadr-bot";
@@ -13,6 +13,11 @@ const TRIGGER: HistoryMessage = {
 	date: "2024-01-01T00:00:00.000Z",
 	replyToId: null,
 };
+
+const CHANNEL: ChannelInfo = { name: "general", topic: "chat about anything" };
+// Most tests don't care about channel info; a plain function (not a vi.fn) keeps them from having
+// to assert on or reset a mock they never look at.
+const fetchChannel = () => Promise.resolve(CHANNEL);
 
 function textResponse(text: string): Response {
 	return new Response(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text }] } }] }), {
@@ -53,7 +58,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// The automatic seed fetch around the trigger, not a model-issued call.
@@ -75,7 +80,32 @@ describe("generateReply", () => {
 		expect(body.systemInstruction.parts[0].text).toContain(BOT_USER_ID);
 		expect(body.systemInstruction.parts[0].text).toContain(BOT_USERNAME);
 		expect(body.contents).toHaveLength(1);
-		expect(JSON.parse(body.contents[0].parts[0].text)).toEqual({ trigger: TRIGGER, messages: [TRIGGER] });
+		expect(JSON.parse(body.contents[0].parts[0].text)).toEqual({ channel: CHANNEL, trigger: TRIGGER, messages: [TRIGGER] });
+	});
+
+	it("passes a channel with no name or topic through as-is, e.g. for a DM", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const dmChannel: ChannelInfo = { name: null, topic: null };
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, () => Promise.resolve(dmChannel), fetchAround);
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		expect(JSON.parse(body.contents[0].parts[0].text).channel).toEqual(dmChannel);
+	});
+
+	it("fetches channel info only once per reply, reused across every Gemini call", async () => {
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const fetchChannelSpy = vi.fn().mockResolvedValue(CHANNEL);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannelSpy, fetchAround);
+
+		expect(fetchChannelSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("seeds context around the trigger before asking the model anything", async () => {
@@ -92,7 +122,7 @@ describe("generateReply", () => {
 		};
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		expect(fetchAround).toHaveBeenCalledTimes(1);
@@ -109,7 +139,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchChannel, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
 		expect(fetchAround).toHaveBeenCalledWith(replyTrigger.id, 10);
@@ -122,7 +152,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		// Once for the automatic seed fetch; the model's own (redundant) request for the trigger — via
 		// an omitted message_id, which falls back to it — is deduped rather than fetched again.
@@ -146,7 +176,7 @@ describe("generateReply", () => {
 		// fetch of "77" brings "earlier" in — isolating what actually changes between the two calls.
 		const fetchAround = vi.fn((anchor: string) => Promise.resolve(anchor === "77" ? [earlier] : []));
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		const secondBody = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
 		// One plain "here's what's known" turn — no functionCall/functionResponse parts anywhere.
@@ -154,6 +184,7 @@ describe("generateReply", () => {
 		expect(secondBody.contents[0].parts[0].functionCall).toBeUndefined();
 		expect(secondBody.contents[0].parts[0].functionResponse).toBeUndefined();
 		expect(JSON.parse(secondBody.contents[0].parts[0].text)).toEqual({
+			channel: CHANNEL,
 			trigger: TRIGGER,
 			messages: [earlier, TRIGGER], // chronological order
 		});
@@ -165,7 +196,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledWith("77", 10);
 	});
@@ -176,7 +207,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
 		// Only the automatic seed fetch — the fallback resolves to an already-seeded anchor, not a
@@ -201,7 +232,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
 		const fetchSpy = vi.mocked(fetch);
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
 		const thirdBody = JSON.parse(fetchSpy.mock.calls[2][1]?.body as string);
@@ -215,7 +246,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		// The automatic seed fetch, plus one for "77" the first time it's asked for — the repeat is deduped.
 		expect(fetchAround).toHaveBeenCalledTimes(2);
@@ -232,7 +263,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		// The automatic seed fetch, plus "77" and "88".
 		expect(fetchAround).toHaveBeenCalledTimes(3);
@@ -249,7 +280,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// Only the automatic seed fetch — send_reply wins outright, so the paired "77" fetch never runs.
@@ -263,7 +294,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: TRIGGER.id });
 	});
@@ -274,7 +305,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: null });
 	});
@@ -293,7 +324,7 @@ describe("generateReply", () => {
 		};
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: "0" });
 	});
@@ -304,7 +335,7 @@ describe("generateReply", () => {
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/exceeded/);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow(/exceeded/);
 
 		expect(fetchSpy).toHaveBeenCalledTimes(6); // MAX_GEMINI_CALLS
 	});
@@ -315,7 +346,7 @@ describe("generateReply", () => {
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow();
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow();
 
 		const finalCallBody = JSON.parse(fetchSpy.mock.calls[5][1]?.body as string);
 		expect(finalCallBody.tools[0].functionDeclarations.map((d: { name: string }) => d.name)).toEqual(["send_reply"]);
@@ -330,7 +361,7 @@ describe("generateReply", () => {
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow();
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow();
 
 		const instructionFor = (call: number) =>
 			JSON.parse(fetchSpy.mock.calls[call][1]?.body as string)
@@ -349,7 +380,7 @@ describe("generateReply", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(textResponse("no function call"));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow(
 			/didn't call a function/,
 		);
 	});
@@ -358,7 +389,7 @@ describe("generateReply", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(functionCallResponse("send_reply", { replyToMessageId: null }));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/without content/);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow(/without content/);
 	});
 
 	it("treats whitespace-only content as no content, rather than letting Discord reject it", async () => {
@@ -367,7 +398,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/without content/);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow(/without content/);
 	});
 
 	it("trims the reply content it returns", async () => {
@@ -376,7 +407,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround);
+		const reply = await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround);
 
 		expect(reply.content).toBe("hi there");
 	});
@@ -393,7 +424,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow(
 			/no content parts.*MAX_TOKENS.*SAFETY/,
 		);
 	});
@@ -402,6 +433,6 @@ describe("generateReply", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad key", { status: 403 }));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchAround)).rejects.toThrow(/403/);
+		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchChannel, fetchAround)).rejects.toThrow(/403/);
 	});
 });

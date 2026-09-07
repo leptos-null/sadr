@@ -1,6 +1,6 @@
 import { delay } from "../delay";
 import { debugLog } from "../log-level";
-import type { DiscordMessage, DiscordUser } from "./types";
+import type { DiscordChannel, DiscordMessage, DiscordUser } from "./types";
 
 const API_BASE = "https://discord.com/api/v10";
 
@@ -21,6 +21,24 @@ function authHeaders(env: Env, hasBody: boolean): HeadersInit {
 	return headers;
 }
 
+/**
+ * Renders the rate-limit headers Discord attaches to most responses. `scope`/`global` are only
+ * ever sent on a 429 (<https://docs.discord.com/developers/topics/rate-limits>), so only rendered there.
+ */
+function rateLimitHeadersSummary(response: Response): string {
+	const headers = response.headers;
+	const parts = [
+		`limit=${headers.get("x-ratelimit-limit") ?? "?"}`,
+		`remaining=${headers.get("x-ratelimit-remaining") ?? "?"}`,
+		`resetAfter=${headers.get("x-ratelimit-reset-after") ?? "?"}s`,
+		`bucket=${headers.get("x-ratelimit-bucket") ?? "none"}`,
+	];
+	if (response.status === 429) {
+		parts.push(`scope=${headers.get("x-ratelimit-scope") ?? "?"}`, `global=${headers.get("x-ratelimit-global") ?? "false"}`);
+	}
+	return parts.join(" ");
+}
+
 /** One request attempt, warning if it took pathologically long. */
 async function sendOnce(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
 	// One predicate for both the header and the payload, so they can't disagree about whether this
@@ -37,6 +55,7 @@ async function sendOnce(env: Env, method: string, path: string, body?: unknown):
 	if (durationMs > SLOW_CALL_THRESHOLD_MS) {
 		console.warn(`Discord REST: ${method} ${path} took ${durationMs}ms`);
 	}
+	debugLog(env, () => `Discord REST: ${method} ${path} rate limit ${rateLimitHeadersSummary(response)}`);
 	return response;
 }
 
@@ -134,7 +153,18 @@ export async function triggerTyping(env: Env, channelId: string): Promise<void> 
 	await discordFetch(env, "POST", `/channels/${channelId}/typing`);
 }
 
-/** Fetches messages from a channel around a given message id (both earlier and later messages). */
+/**
+ * Fetches a channel's metadata — used to give Gemini the channel's name/topic for context.
+ * Observed rate-limit bucket: 1000 per 0.001s.
+ */
+export function getChannel(env: Env, channelId: string): Promise<DiscordChannel> {
+	return discordJson<DiscordChannel>(env, "GET", `/channels/${channelId}`);
+}
+
+/**
+ * Fetches messages from a channel around a given message id (both earlier and later messages).
+ * Observed rate-limit bucket: 5 per 1s, per channel.
+ */
 export function getChannelMessages(
 	env: Env,
 	channelId: string,
