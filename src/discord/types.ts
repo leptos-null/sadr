@@ -20,6 +20,13 @@ export interface DiscordChannel {
 	topic?: string | null;
 }
 
+/** <https://docs.discord.com/developers/resources/guild#guild-object>; only the fields this bot reads. */
+export interface DiscordGuild {
+	name: string;
+	/** Always present in the payload, though frequently null when no description is set. */
+	description: string | null;
+}
+
 export interface DiscordMessage {
 	id: string;
 	content: string;

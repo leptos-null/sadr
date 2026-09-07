@@ -34,6 +34,12 @@ export interface ChannelInfo {
 	topic: string | null;
 }
 
+/** The Discord guild (server) a reply is being generated for, or null for a DM (which has none). */
+export interface GuildInfo {
+	name: string;
+	description: string | null;
+}
+
 export interface ReplyResult {
 	content: string;
 	replyToMessageId: string | null;
@@ -134,7 +140,8 @@ function buildSystemInstruction(
 			{
 				text: `You are "${botUsername}", a Discord bot with user id "${botUserId}". Every response must be a function call.
 
-Each turn you receive JSON of the shape {"channel", "trigger", "messages"}.
+Each turn you receive JSON of the shape {"guild", "channel", "trigger", "messages"}.
+- "guild" is {"name", "description"} for the Discord server this is happening in, or null for a DM. "description" alone may be null even in a guild if none is set.
 - "channel" is {"name", "topic"} for the Discord channel this is happening in. Either may be null — a DM has neither, and a guild channel may have no topic set.
 - "trigger" is the message addressed to you. Reply to it, whatever else "messages" contains.
 - "messages" is every message you currently know, oldest first, including "trigger".
@@ -200,13 +207,18 @@ async function callGemini(
 }
 
 /** Builds a single fresh turn reflecting everything currently known — no function-call scaffolding. */
-function buildContents(trigger: HistoryMessage, resolved: Map<string, HistoryMessage>, channel: ChannelInfo): Content[] {
+function buildContents(
+	trigger: HistoryMessage,
+	resolved: Map<string, HistoryMessage>,
+	guild: GuildInfo | null,
+	channel: ChannelInfo,
+): Content[] {
 	// Parsed rather than compared as strings, so ordering doesn't depend on Discord rendering every
 	// timestamp at identical precision.
 	const messages = [...resolved.values()].sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
 	// The full trigger message, not just its id — no lookup into a (possibly large) list required
 	// to know what's actually being responded to.
-	return [{ role: "user", parts: [{ text: JSON.stringify({ channel, trigger, messages }) }] }];
+	return [{ role: "user", parts: [{ text: JSON.stringify({ guild, channel, trigger, messages }) }] }];
 }
 
 /**
@@ -231,10 +243,11 @@ function toReplyResult(functionCall: FunctionCall, resolved: Map<string, History
  * Generates a reply to `trigger`. Before asking the model anything, the messages surrounding the
  * trigger — and, if the trigger is itself a reply, the messages surrounding whatever it's replying
  * to — are fetched and seeded into context: the two things a model would almost always ask for
- * anyway, done up front instead of costing it a turn. The channel's name/topic are fetched
- * alongside that seeding (not on the model's request — unlike message history, there's no
- * `fetch_channel` tool) so the model always has them without spending a turn. From there the model
- * can still call `fetch_message_history` (around a message id) to pull in further context and `send_reply` once
+ * anyway, done up front instead of costing it a turn. The guild's name/description (null for a DM)
+ * and the channel's name/topic are fetched alongside that seeding (not on the model's request —
+ * unlike message history, there's no `fetch_guild`/`fetch_channel` tool) so the model always has
+ * them without spending a turn. From there the model can still call `fetch_message_history`
+ * (around a message id) to pull in further context and `send_reply` once
  * ready; fetched messages accumulate in a resolved map keyed by id, and each Gemini call is given a
  * freshly rebuilt, deduped, chronological view of that map rather than an ever-growing transcript of
  * past tool calls. `fetch_message_history` is withheld on the final allowed call, forcing the model
@@ -245,6 +258,7 @@ export async function generateReply(
 	botUserId: string,
 	botUsername: string,
 	trigger: HistoryMessage,
+	fetchGuild: () => Promise<GuildInfo | null>,
 	fetchChannel: () => Promise<ChannelInfo>,
 	fetchAround: (messageId: string, limit: number) => Promise<HistoryMessage[]>,
 ): Promise<ReplyResult> {
@@ -255,8 +269,9 @@ export async function generateReply(
 	const seedAnchors = trigger.replyToId ? [trigger.id, trigger.replyToId] : [trigger.id];
 	for (const anchor of seedAnchors) fetchedAnchors.add(anchor);
 
-	// Run alongside the seed fetches, not after, so it doesn't add its own round-trip of latency.
-	const [channel, seeded] = await Promise.all([
+	// Run alongside the seed fetches, not after, so neither adds its own round-trip of latency.
+	const [guild, channel, seeded] = await Promise.all([
+		fetchGuild(),
 		fetchChannel(),
 		Promise.all(seedAnchors.map((anchor) => fetchAround(anchor, AROUND_FETCH_LIMIT))),
 	]);
@@ -269,7 +284,7 @@ export async function generateReply(
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
 		const parts = await callGemini(
 			env,
-			buildContents(trigger, resolved, channel),
+			buildContents(trigger, resolved, guild, channel),
 			botUserId,
 			botUsername,
 			gatherTurnsLeft,

@@ -1,6 +1,6 @@
 import { delay } from "../delay";
 import { debugLog } from "../log-level";
-import type { DiscordChannel, DiscordMessage, DiscordUser } from "./types";
+import type { DiscordChannel, DiscordGuild, DiscordMessage, DiscordUser } from "./types";
 
 const API_BASE = "https://discord.com/api/v10";
 
@@ -159,6 +159,14 @@ export async function triggerTyping(env: Env, channelId: string): Promise<void> 
  */
 export function getChannel(env: Env, channelId: string): Promise<DiscordChannel> {
 	return discordJson<DiscordChannel>(env, "GET", `/channels/${channelId}`);
+}
+
+/**
+ * Fetches a guild's metadata — used to give Gemini the guild's name/description for context.
+ * Observed rate-limit bucket: 1000 per 0.001s.
+ */
+export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {
+	return discordJson<DiscordGuild>(env, "GET", `/guilds/${guildId}`);
 }
 
 /**

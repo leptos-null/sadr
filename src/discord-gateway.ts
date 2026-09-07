@@ -4,6 +4,7 @@ import {
 	getChannelMessages,
 	getCurrentUser,
 	getGatewayBotUrl,
+	getGuild,
 	sendMessage,
 	triggerTyping,
 } from "./discord/rest";
@@ -17,8 +18,8 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
-import type { DiscordChannel, DiscordMessage } from "./discord/types";
-import { generateReply, type ChannelInfo, type HistoryMessage } from "./gemini";
+import type { DiscordChannel, DiscordGuild, DiscordMessage } from "./discord/types";
+import { generateReply, type ChannelInfo, type GuildInfo, type HistoryMessage } from "./gemini";
 import { delay } from "./delay";
 import { debugLog, errorMessage } from "./log-level";
 
@@ -59,6 +60,11 @@ function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 /** As `toHistoryMessage`, for the channel metadata Gemini is given. */
 function toChannelInfo(channel: DiscordChannel): ChannelInfo {
 	return { name: channel.name ?? null, topic: channel.topic ?? null };
+}
+
+/** As `toHistoryMessage`, for the guild metadata Gemini is given. */
+function toGuildInfo(guild: DiscordGuild): GuildInfo {
+	return { name: guild.name, description: guild.description };
 }
 
 export class DiscordGateway extends DurableObject<Env> {
@@ -233,8 +239,10 @@ export class DiscordGateway extends DurableObject<Env> {
 						this.botUserId,
 						this.botUsername,
 						toHistoryMessage(message),
-						// A DM channel never carries a name/topic, so skip the REST round-trip entirely for one —
-						// guild_id's absence is the same DM check mentions.ts's isAddressedToBot relies on.
+						// guild_id's absence is Discord's own DM signal (the same check mentions.ts's
+						// isAddressedToBot relies on). A DM has no guild, and its channel never carries a
+						// name/topic either, so both REST round-trips below are skipped entirely for a DM.
+						async () => (message.guild_id ? toGuildInfo(await getGuild(this.env, message.guild_id)) : null),
 						async () =>
 							message.guild_id
 								? toChannelInfo(await getChannel(this.env, message.channel_id))
