@@ -1,6 +1,14 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { getChannelMessages, getCurrentUser, getGatewayBotUrl, sendMessage, triggerTyping } from "../../src/discord/rest";
+import {
+	getChannelMessages,
+	getCurrentUser,
+	getGatewayBotUrl,
+	getGuildMember,
+	getThreadMember,
+	sendMessage,
+	triggerTyping,
+} from "../../src/discord/rest";
 
 describe("getGatewayBotUrl", () => {
 	afterEach(() => {
@@ -190,6 +198,72 @@ describe("triggerTyping", () => {
 	});
 });
 
+describe("getGuildMember", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("returns the member's roles when the lookup succeeds", async () => {
+		env.DISCORD_TOKEN = "test-discord-token";
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(new Response(JSON.stringify({ roles: ["10", "20"] }), { status: 200 }));
+
+		const result = await getGuildMember(env, "111", "999");
+
+		expect(result).toEqual({ roles: ["10", "20"] });
+		const [requestUrl, init] = fetchSpy.mock.calls[0];
+		expect(requestUrl).toBe("https://discord.com/api/v10/guilds/111/members/999");
+		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
+	});
+
+	it("returns null, rather than throwing, on a 404 (not a member)", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Unknown Member", { status: 404 }));
+
+		await expect(getGuildMember(env, "111", "999")).resolves.toBeNull();
+	});
+
+	it("still throws on a failure other than 404", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
+
+		await expect(getGuildMember(env, "111", "999")).rejects.toThrow(/401/);
+	});
+});
+
+describe("getThreadMember", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	it("requests the single-user thread-members route and returns the membership", async () => {
+		env.DISCORD_TOKEN = "test-discord-token";
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(
+				new Response(JSON.stringify({ join_timestamp: "2024-01-01T00:00:00.000Z", flags: 0 }), { status: 200 }),
+			);
+
+		const result = await getThreadMember(env, "222", "999");
+
+		expect(result).toEqual({ join_timestamp: "2024-01-01T00:00:00.000Z", flags: 0 });
+		const [requestUrl, init] = fetchSpy.mock.calls[0];
+		expect(requestUrl).toBe("https://discord.com/api/v10/channels/222/thread-members/999");
+		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
+	});
+
+	it("returns null, rather than throwing, on a 404 (never added to the thread)", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Unknown Member", { status: 404 }));
+
+		await expect(getThreadMember(env, "222", "999")).resolves.toBeNull();
+	});
+
+	it("still throws on a failure other than 404", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("missing access", { status: 403 }));
+
+		await expect(getThreadMember(env, "222", "999")).rejects.toThrow(/403/);
+	});
+});
+
 describe("getChannelMessages", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
@@ -210,6 +284,16 @@ describe("getChannelMessages", () => {
 		const [requestUrl, init] = fetchSpy.mock.calls[0];
 		expect(requestUrl).toBe("https://discord.com/api/v10/channels/123/messages?around=456&limit=10");
 		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
+	});
+
+	it("omits the around param entirely when given null, fetching the channel's most recent messages", async () => {
+		env.DISCORD_TOKEN = "test-discord-token";
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+		await getChannelMessages(env, "123", { around: null, limit: 10 });
+
+		const [requestUrl] = fetchSpy.mock.calls[0];
+		expect(requestUrl).toBe("https://discord.com/api/v10/channels/123/messages?limit=10");
 	});
 
 	it("throws with response detail on failure", async () => {

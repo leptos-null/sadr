@@ -49,7 +49,6 @@ export interface ReadyDispatchData {
 }
 
 export interface MessageCreateDispatchData extends DiscordMessage {
-	channel_id: string;
 	/** Discord always sends these on a dispatch, unlike the optional base type (REST is more lenient). */
 	mentions: DiscordUser[];
 	attachments: DiscordAttachment[];

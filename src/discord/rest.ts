@@ -1,6 +1,13 @@
 import { delay } from "../delay";
 import { debugLog } from "../log-level";
-import type { DiscordChannel, DiscordGuild, DiscordMessage, DiscordUser } from "./types";
+import type {
+	DiscordChannel,
+	DiscordGuild,
+	DiscordGuildMember,
+	DiscordMessage,
+	DiscordThreadMember,
+	DiscordUser,
+} from "./types";
 
 const API_BASE = "https://discord.com/api/v10";
 
@@ -75,9 +82,25 @@ function rateLimitRetryMs(response: Response): number | null {
 /**
  * Makes a Discord REST call with bot auth, logging the request at debug level, retrying a
  * short-lived 429, and throwing with response detail on failure. `path` is relative to `API_BASE`
- * and should include any query string.
+ * and should include any query string. With `allowMissing`, a 404 is treated as "doesn't exist"
+ * rather than a failure — returns null instead of throwing, for a lookup where that's a normal,
+ * expected outcome (e.g. checking whether a user is a member of a guild) rather than an error.
  */
-async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
+async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response>;
+async function discordFetch(
+	env: Env,
+	method: string,
+	path: string,
+	body: unknown,
+	options: { allowMissing: true },
+): Promise<Response | null>;
+async function discordFetch(
+	env: Env,
+	method: string,
+	path: string,
+	body?: unknown,
+	options?: { allowMissing?: boolean },
+): Promise<Response | null> {
 	debugLog(env, () => `Discord REST: ${method} ${path}${body === undefined ? "" : ` ${JSON.stringify(body)}`}`);
 	// Unbounded on purpose: the retry budget is spent via `attempt` below, and bounding the loop
 	// itself would add a tail the compiler demands but nothing can reach.
@@ -85,6 +108,7 @@ async function discordFetch(env: Env, method: string, path: string, body?: unkno
 		const response = await sendOnce(env, method, path, body);
 		const retryMs = attempt < MAX_RATE_LIMIT_RETRIES ? rateLimitRetryMs(response) : null;
 		if (retryMs === null) {
+			if (options?.allowMissing && response.status === 404) return null;
 			if (!response.ok) {
 				throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
 			}
@@ -170,14 +194,55 @@ export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {
 }
 
 /**
- * Fetches messages from a channel around a given message id (both earlier and later messages).
+ * Fetches a guild member — specifically their roles, used to check a Discord message-link's target
+ * channel against the requesting user's own role overwrites, not just `@everyone`'s. Null if
+ * `userId` isn't a member of `guildId` (a 404 here just means that, not a failure).
+ */
+export async function getGuildMember(env: Env, guildId: string, userId: string): Promise<DiscordGuildMember | null> {
+	const response = await discordFetch(env, "GET", `/guilds/${guildId}/members/${userId}`, undefined, {
+		allowMissing: true,
+	});
+	if (!response) return null;
+	const data = (await response.json()) as DiscordGuildMember;
+	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	return data;
+}
+
+/**
+ * Fetches a thread member — used only to check whether `userId` was actually added to a private
+ * thread, whose audience is that explicit list rather than anything in its parent channel's
+ * overwrites. Null if they aren't a member (a 404 here just means that, not a failure).
+ *
+ * Membership on its own doesn't prove they can still see the thread: losing access to the parent
+ * channel doesn't remove anyone from a thread, and they keep being reported as a member afterwards
+ * (<https://docs.discord.com/developers/topics/threads#losing-access-to-channels>), so
+ * `canReadChannel` has to pass against the parent channel as well. Unlike `List Thread Members`,
+ * this single-user route carries no `GUILD_MEMBERS` privileged-intent requirement.
+ */
+export async function getThreadMember(env: Env, threadId: string, userId: string): Promise<DiscordThreadMember | null> {
+	const response = await discordFetch(env, "GET", `/channels/${threadId}/thread-members/${userId}`, undefined, {
+		allowMissing: true,
+	});
+	if (!response) return null;
+	const data = (await response.json()) as DiscordThreadMember;
+	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	return data;
+}
+
+/**
+ * Fetches messages from a channel around a given message id (both earlier and later messages), or,
+ * with `around: null`, the channel's most recent messages instead — Discord's own behavior when no
+ * `around`/`before`/`after` param is given at all.
+ * <https://docs.discord.com/developers/resources/message#get-channel-messages>
  * Observed rate-limit bucket: 5 per 1s, per channel.
  */
 export function getChannelMessages(
 	env: Env,
 	channelId: string,
-	options: { around: string; limit: number },
+	options: { around: string | null; limit: number },
 ): Promise<DiscordMessage[]> {
-	const params = new URLSearchParams({ around: options.around, limit: String(options.limit) });
+	const params = new URLSearchParams();
+	if (options.around !== null) params.set("around", options.around);
+	params.set("limit", String(options.limit));
 	return discordJson<DiscordMessage[]>(env, "GET", `/channels/${channelId}/messages?${params}`);
 }
