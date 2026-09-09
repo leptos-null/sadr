@@ -90,17 +90,29 @@ describe("generateReply", () => {
 		});
 	});
 
-	it("passes a channel with no name or topic through as-is, e.g. for a DM", async () => {
+	it("passes a channel with a null topic through as-is", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
-		const dmChannel: ChannelInfo = { name: null, topic: null };
+		const noTopic: ChannelInfo = { name: "general", topic: null };
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, () => Promise.resolve(dmChannel), fetchAround);
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, () => Promise.resolve(noTopic), fetchAround);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		expect(JSON.parse(body.contents[0].parts[0].text).channel).toEqual(dmChannel);
+		expect(JSON.parse(body.contents[0].parts[0].text).channel).toEqual(noTopic);
+	});
+
+	it("omits channel entirely for a DM, rather than sending it as null", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, () => Promise.resolve(null), fetchAround);
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		expect(JSON.parse(body.contents[0].parts[0].text)).not.toHaveProperty("channel");
 	});
 
 	it("fetches channel info only once per reply, reused across every Gemini call", async () => {
@@ -115,7 +127,7 @@ describe("generateReply", () => {
 		expect(fetchChannelSpy).toHaveBeenCalledTimes(1);
 	});
 
-	it("passes a null guild through as-is, e.g. for a DM", async () => {
+	it("omits guild entirely for a DM, rather than sending it as null", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
@@ -124,7 +136,7 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, () => Promise.resolve(null), fetchChannel, fetchAround);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		expect(JSON.parse(body.contents[0].parts[0].text).guild).toBeNull();
+		expect(JSON.parse(body.contents[0].parts[0].text)).not.toHaveProperty("guild");
 	});
 
 	it("fetches guild info only once per reply, reused across every Gemini call", async () => {

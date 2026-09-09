@@ -28,7 +28,7 @@ export interface HistoryMessage {
 	replyToId: string | null;
 }
 
-/** The Discord channel a reply is being generated for. Both fields are null for a DM; topic alone can also be null for a guild channel with none set. */
+/** The Discord channel a reply is being generated for, or null for a DM (which has none). Topic alone can still be null for a guild channel with none set. */
 export interface ChannelInfo {
 	name: string | null;
 	topic: string | null;
@@ -119,8 +119,29 @@ const sendReplyDeclaration = {
 function buildSystemInstruction(
 	botUserId: string,
 	botUsername: string,
+	guild: GuildInfo | null,
+	channel: ChannelInfo | null,
 	gatherTurnsLeft: number,
 ): { parts: Array<{ text: string }> } {
+	const lines: Array<string> = [
+		`You are "${botUsername}", a Discord bot with user id "${botUserId}". Every response must be a function call.`,
+		'"trigger" is the request made to you. The remaining fields serve only as context.',
+	];
+
+	if (guild) {
+		lines.push('"guild" is {"name", "description"} for the Discord server this is happening in.');
+	}
+
+	lines.push(
+		channel
+			? '"channel" is {"name", "topic"} for the Discord channel this is happening in.'
+			: "This conversation is in a direct message — just you and the other person.",
+	);
+
+	lines.push('"messages" is every message you currently know, oldest first, including "trigger".');
+
+	lines.push(`Each message is {"id", "user", "userId", "content", "date", "replyToId"}: "user" is a display name, "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${botUserId}" is one you sent.`);
+
 	// The budget counts down per call, so the model is told what it actually has left rather than a
 	// constant it can't act on. At 0 the wording must never name the withheld tool: each call is
 	// stateless, so the model on that call has never seen it declared.
@@ -137,19 +158,7 @@ function buildSystemInstruction(
 
 	return {
 		parts: [
-			{
-				text: `You are "${botUsername}", a Discord bot with user id "${botUserId}". Every response must be a function call.
-
-Each turn you receive JSON of the shape {"guild", "channel", "trigger", "messages"}.
-- "guild" is {"name", "description"} for the Discord server this is happening in, or null for a DM. "description" alone may be null even in a guild if none is set.
-- "channel" is {"name", "topic"} for the Discord channel this is happening in. Either may be null — a DM has neither, and a guild channel may have no topic set.
-- "trigger" is the message addressed to you. Reply to it, whatever else "messages" contains.
-- "messages" is every message you currently know, oldest first, including "trigger".
-
-Each message is {"id", "user", "userId", "content", "date", "replyToId"}: "user" is a display name, "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${botUserId}" is one you sent.
-
-"content" may contain raw mention tokens like <@userId> or <@!userId>. Match the id against "userId" in "messages" to see who is meant.`,
-			},
+			{ text: lines.join("\n") },
 			{ text: guidance },
 		],
 	};
@@ -167,13 +176,15 @@ async function callGemini(
 	contents: Content[],
 	botUserId: string,
 	botUsername: string,
+	guild: GuildInfo | null,
+	channel: ChannelInfo | null,
 	gatherTurnsLeft: number,
 ): Promise<ContentPart[]> {
 	const functionDeclarations =
 		gatherTurnsLeft > 0 ? [fetchHistoryDeclaration, sendReplyDeclaration] : [sendReplyDeclaration];
 	const requestBody: GenerateContentRequest = {
 		contents,
-		systemInstruction: buildSystemInstruction(botUserId, botUsername, gatherTurnsLeft),
+		systemInstruction: buildSystemInstruction(botUserId, botUsername, guild, channel, gatherTurnsLeft),
 		tools: [{ functionDeclarations }],
 		toolConfig: { functionCallingConfig: { mode: "ANY" } },
 	};
@@ -211,14 +222,21 @@ function buildContents(
 	trigger: HistoryMessage,
 	resolved: Map<string, HistoryMessage>,
 	guild: GuildInfo | null,
-	channel: ChannelInfo,
+	channel: ChannelInfo | null,
 ): Content[] {
 	// Parsed rather than compared as strings, so ordering doesn't depend on Discord rendering every
 	// timestamp at identical precision.
 	const messages = [...resolved.values()].sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
-	// The full trigger message, not just its id — no lookup into a (possibly large) list required
-	// to know what's actually being responded to.
-	return [{ role: "user", parts: [{ text: JSON.stringify({ guild, channel, trigger, messages }) }] }];
+
+	const payload = {
+		...(guild ? { guild } : {}),
+		...(channel ? { channel } : {}),
+		// The full trigger message, not just its id — no lookup into a (possibly large) list
+		// required to know what's actually being responded to.
+		trigger,
+		messages,
+	};
+	return [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }];
 }
 
 /**
@@ -259,7 +277,7 @@ export async function generateReply(
 	botUsername: string,
 	trigger: HistoryMessage,
 	fetchGuild: () => Promise<GuildInfo | null>,
-	fetchChannel: () => Promise<ChannelInfo>,
+	fetchChannel: () => Promise<ChannelInfo | null>,
 	fetchAround: (messageId: string, limit: number) => Promise<HistoryMessage[]>,
 ): Promise<ReplyResult> {
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
@@ -287,6 +305,8 @@ export async function generateReply(
 			buildContents(trigger, resolved, guild, channel),
 			botUserId,
 			botUsername,
+			guild,
+			channel,
 			gatherTurnsLeft,
 		);
 

@@ -243,10 +243,7 @@ export class DiscordGateway extends DurableObject<Env> {
 						// isAddressedToBot relies on). A DM has no guild, and its channel never carries a
 						// name/topic either, so both REST round-trips below are skipped entirely for a DM.
 						async () => (message.guild_id ? toGuildInfo(await getGuild(this.env, message.guild_id)) : null),
-						async () =>
-							message.guild_id
-								? toChannelInfo(await getChannel(this.env, message.channel_id))
-								: { name: null, topic: null },
+						async () => (message.guild_id ? toChannelInfo(await getChannel(this.env, message.channel_id)) : null),
 						async (messageId, limit) => {
 							const around = await getChannelMessages(this.env, message.channel_id, { around: messageId, limit });
 							return around.map(toHistoryMessage);
