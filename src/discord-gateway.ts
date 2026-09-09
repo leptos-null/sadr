@@ -18,8 +18,8 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
-import type { DiscordChannel, DiscordGuild, DiscordMessage } from "./discord/types";
-import { generateReply, type ChannelInfo, type GuildInfo, type HistoryMessage } from "./gemini";
+import type { DiscordChannel, DiscordGuild, DiscordMessage, DiscordUser } from "./discord/types";
+import { generateReply, type ChannelInfo, type GuildInfo, type HistoryMessage, type UserInfo } from "./gemini";
 import { delay } from "./delay";
 import { debugLog, errorMessage } from "./log-level";
 
@@ -45,15 +45,25 @@ const TYPING_REFRESH_MS = 8_000;
 /** Sent to the user when generating or delivering a real reply failed — silence is worse. */
 const FALLBACK_REPLY = "Sorry — something went wrong while I was working on a reply. Mind trying again?";
 
+/** As `toHistoryMessage`, for a single Discord user's name info. */
+function toUserInfo(user: DiscordUser): UserInfo {
+	return { username: user.username, globalName: user.global_name ?? null };
+}
+
 /** Maps either transport's message shape — both extend `DiscordMessage` — to what Gemini is given. */
 function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 	return {
 		id: message.id,
-		user: message.author.username,
 		userId: message.author.id,
+		author: toUserInfo(message.author),
 		content: message.content,
 		date: message.timestamp,
 		replyToId: message.message_reference?.message_id ?? null,
+		editedDate: message.edited_timestamp ?? undefined,
+		attachments: message.attachments?.length ? message.attachments.map((attachment) => attachment.filename) : undefined,
+		mentionedUsers: message.mentions?.length
+			? message.mentions.map((mentioned) => ({ id: mentioned.id, ...toUserInfo(mentioned) }))
+			: undefined,
 	};
 }
 

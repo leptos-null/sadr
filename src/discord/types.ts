@@ -7,6 +7,8 @@
 export interface DiscordUser {
 	id: string;
 	username: string;
+	/** Discord's account-wide display name; null (or absent) when unset, in which case Discord itself falls back to showing `username`. */
+	global_name?: string | null;
 	/** Discord sends this on both transports; only the Gateway path reads it, to ignore other bots. */
 	bot?: boolean;
 }
@@ -27,6 +29,11 @@ export interface DiscordGuild {
 	description: string | null;
 }
 
+export interface DiscordAttachment {
+	filename: string;
+	url: string;
+}
+
 export interface DiscordMessage {
 	id: string;
 	content: string;
@@ -35,4 +42,10 @@ export interface DiscordMessage {
 	author: DiscordUser;
 	/** Present when this message is a Discord reply to another message. */
 	message_reference?: { message_id?: string };
+	/** Files/images the message carries. Always sent as an array (possibly empty) by Discord. */
+	attachments?: DiscordAttachment[];
+	/** Users mentioned in `content`; Discord resolves this itself, independent of who's actually posted. */
+	mentions?: DiscordUser[];
+	/** ISO 8601, or null if the message has never been edited. */
+	edited_timestamp?: string | null;
 }

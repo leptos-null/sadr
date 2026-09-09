@@ -1,18 +1,33 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { generateReply, type ChannelInfo, type GuildInfo, type HistoryMessage } from "../src/gemini";
+import { generateReply, type ChannelInfo, type GuildInfo, type HistoryMessage, type UserInfo } from "../src/gemini";
 
 const BOT_USER_ID = "999";
 const BOT_USERNAME = "sadr-bot";
 
 const TRIGGER: HistoryMessage = {
 	id: "1",
-	user: "alice",
 	userId: "111",
+	author: { username: "alice", globalName: null },
 	content: "hello?",
 	date: "2024-01-01T00:00:00.000Z",
 	replyToId: null,
 };
+
+/** Mirrors gemini.ts's own transform: what a HistoryMessage looks like once name info moves to `users`. */
+function payloadMessage({ author: _author, mentionedUsers: _mentionedUsers, ...rest }: HistoryMessage) {
+	return rest;
+}
+
+/** Mirrors gemini.ts's own transform: the `users` map a set of messages should produce. */
+function usersOf(...messages: HistoryMessage[]): Record<string, UserInfo> {
+	const users: Record<string, UserInfo> = {};
+	for (const message of messages) {
+		users[message.userId] = message.author;
+		for (const { id, ...info } of message.mentionedUsers ?? []) users[id] = info;
+	}
+	return users;
+}
 
 const GUILD: GuildInfo = { name: "sadr's server", description: "a place to chat" };
 const CHANNEL: ChannelInfo = { name: "general", topic: "chat about anything" };
@@ -65,7 +80,7 @@ describe("generateReply", () => {
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// The automatic seed fetch around the trigger, not a model-issued call.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
+		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 100);
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
 		const [requestUrl, init] = fetchSpy.mock.calls[0];
@@ -85,9 +100,95 @@ describe("generateReply", () => {
 		expect(JSON.parse(body.contents[0].parts[0].text)).toEqual({
 			guild: GUILD,
 			channel: CHANNEL,
-			trigger: TRIGGER,
-			messages: [TRIGGER],
+			trigger: payloadMessage(TRIGGER),
+			messages: [payloadMessage(TRIGGER)],
+			users: usersOf(TRIGGER),
 		});
+	});
+
+	it("includes attachments on a message that has them, and omits the key otherwise", async () => {
+		const withAttachment: HistoryMessage = {
+			...TRIGGER,
+			id: "2",
+			attachments: ["screenshot.png"],
+		};
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([withAttachment]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround);
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const { messages } = JSON.parse(body.contents[0].parts[0].text);
+		expect(messages).toContainEqual(payloadMessage(withAttachment));
+		// TRIGGER itself has none, so the key shouldn't appear at all.
+		expect(messages.find((message: HistoryMessage) => message.id === TRIGGER.id)).not.toHaveProperty(
+			"attachments",
+		);
+	});
+
+	it("includes editedDate on a message that's been edited, and omits the key otherwise", async () => {
+		const edited: HistoryMessage = { ...TRIGGER, id: "2", editedDate: "2024-01-01T00:05:00.000Z" };
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([edited]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround);
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const { messages } = JSON.parse(body.contents[0].parts[0].text);
+		expect(messages).toContainEqual(payloadMessage(edited));
+		// TRIGGER itself was never edited, so the key shouldn't appear at all.
+		expect(messages.find((message: HistoryMessage) => message.id === TRIGGER.id)).not.toHaveProperty("editedDate");
+	});
+
+	it("includes a mentioned user's name in \"users\" even if they've never posted in view", async () => {
+		const withMention: HistoryMessage = {
+			...TRIGGER,
+			mentionedUsers: [{ id: "555", username: "carol", globalName: "Carol C." }],
+		};
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, withMention, fetchGuild, fetchChannel, fetchAround);
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const { users } = JSON.parse(body.contents[0].parts[0].text);
+		expect(users["555"]).toEqual({ username: "carol", globalName: "Carol C." });
+	});
+
+	it("trims oldest context first when the payload would exceed the size budget", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		// 30 messages of 1000 chars each, all before TRIGGER's date, comfortably exceeds gemini.ts's
+		// 15k-char MAX_PAYLOAD_CHARS.
+		const bulky: HistoryMessage[] = Array.from({ length: 30 }, (_, index) => ({
+			id: `bulk-${index}`,
+			userId: "222",
+			author: { username: "bob", globalName: null },
+			content: "x".repeat(1000),
+			date: new Date(Date.parse("2023-12-01T00:00:00.000Z") + index * 60_000).toISOString(),
+			replyToId: null,
+		}));
+		const fetchAround = vi.fn().mockResolvedValue(bulky);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround);
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const text = body.contents[0].parts[0].text as string;
+		const { messages } = JSON.parse(text);
+
+		expect(text.length).toBeLessThanOrEqual(15_000);
+		// Dropped from the oldest end first...
+		expect(messages.some((message: HistoryMessage) => message.id === "bulk-0")).toBe(false);
+		// ...but the trigger and the most recent context survive.
+		expect(messages.some((message: HistoryMessage) => message.id === TRIGGER.id)).toBe(true);
+		expect(messages.some((message: HistoryMessage) => message.id === "bulk-29")).toBe(true);
 	});
 
 	it("passes a channel with a null topic through as-is", async () => {
@@ -157,8 +258,8 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const earlier: HistoryMessage = {
 			id: "0",
-			user: "bob",
 			userId: "222",
+			author: { username: "bob", globalName: null },
 			content: "earlier message",
 			date: "2023-12-31T00:00:00.000Z",
 			replyToId: null,
@@ -169,10 +270,13 @@ describe("generateReply", () => {
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
+		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 100);
 		// The seeded message actually reached the model on its very first call, not just the fetch itself.
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		expect(JSON.parse(body.contents[0].parts[0].text).messages).toEqual([earlier, TRIGGER]);
+		expect(JSON.parse(body.contents[0].parts[0].text).messages).toEqual([
+			payloadMessage(earlier),
+			payloadMessage(TRIGGER),
+		]);
 	});
 
 	it("also seeds context around the reply target when the trigger is itself a reply", async () => {
@@ -185,8 +289,31 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchGuild, fetchChannel, fetchAround);
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
-		expect(fetchAround).toHaveBeenCalledWith(replyTrigger.id, 10);
-		expect(fetchAround).toHaveBeenCalledWith("42", 10);
+		expect(fetchAround).toHaveBeenCalledWith(replyTrigger.id, 100);
+		expect(fetchAround).toHaveBeenCalledWith("42", 100);
+	});
+
+	it("skips the reply-target fetch when the trigger's own window already contains it", async () => {
+		const replyTrigger: HistoryMessage = { ...TRIGGER, replyToId: "42" };
+		const replyTarget: HistoryMessage = {
+			id: "42",
+			userId: "222",
+			author: { username: "bob", globalName: null },
+			content: "original message",
+			date: "2023-12-31T00:00:00.000Z",
+			replyToId: null,
+		};
+		vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }),
+		);
+		const fetchAround = vi.fn().mockResolvedValue([replyTarget]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchGuild, fetchChannel, fetchAround);
+
+		// Only the trigger's own seed fetch — "42" already came back in that window, so the
+		// second round-trip is skipped entirely.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		expect(fetchAround).toHaveBeenCalledWith(replyTrigger.id, 100);
 	});
 
 	it("treats a model-issued fetch of an already-seeded anchor as a no-op", async () => {
@@ -209,8 +336,8 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const earlier: HistoryMessage = {
 			id: "0",
-			user: "bob",
 			userId: "222",
+			author: { username: "bob", globalName: null },
 			content: "earlier message",
 			date: "2023-12-31T00:00:00.000Z",
 			replyToId: null,
@@ -229,8 +356,9 @@ describe("generateReply", () => {
 		expect(JSON.parse(secondBody.contents[0].parts[0].text)).toEqual({
 			guild: GUILD,
 			channel: CHANNEL,
-			trigger: TRIGGER,
-			messages: [earlier, TRIGGER], // chronological order
+			trigger: payloadMessage(TRIGGER),
+			messages: [payloadMessage(earlier), payloadMessage(TRIGGER)], // chronological order
+			users: usersOf(earlier, TRIGGER),
 		});
 	});
 
@@ -242,7 +370,7 @@ describe("generateReply", () => {
 
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround);
 
-		expect(fetchAround).toHaveBeenCalledWith("77", 10);
+		expect(fetchAround).toHaveBeenCalledWith("77", 20);
 	});
 
 	it("falls back to the trigger id when the model passes an empty string instead of omitting message_id", async () => {
@@ -253,7 +381,7 @@ describe("generateReply", () => {
 
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround);
 
-		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
+		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 100);
 		// Only the automatic seed fetch — the fallback resolves to an already-seeded anchor, not a
 		// spurious fetch for the literal empty string.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
@@ -266,8 +394,8 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const earlier: HistoryMessage = {
 			id: "0",
-			user: "bob",
 			userId: "222",
+			author: { username: "bob", globalName: null },
 			content: "earlier message",
 			date: "2023-12-31T00:00:00.000Z",
 			replyToId: null,
@@ -280,7 +408,10 @@ describe("generateReply", () => {
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
 		const thirdBody = JSON.parse(fetchSpy.mock.calls[2][1]?.body as string);
-		expect(JSON.parse(thirdBody.contents[0].parts[0].text).messages).toEqual([earlier, TRIGGER]);
+		expect(JSON.parse(thirdBody.contents[0].parts[0].text).messages).toEqual([
+			payloadMessage(earlier),
+			payloadMessage(TRIGGER),
+		]);
 	});
 
 	it("skips the round-trip when the model re-fetches an anchor it already asked for", async () => {
@@ -311,8 +442,8 @@ describe("generateReply", () => {
 
 		// The automatic seed fetch, plus "77" and "88".
 		expect(fetchAround).toHaveBeenCalledTimes(3);
-		expect(fetchAround).toHaveBeenCalledWith("77", 10);
-		expect(fetchAround).toHaveBeenCalledWith("88", 10);
+		expect(fetchAround).toHaveBeenCalledWith("77", 20);
+		expect(fetchAround).toHaveBeenCalledWith("88", 20);
 	});
 
 	it("takes send_reply and drops fetches the model paired with it", async () => {
@@ -329,7 +460,7 @@ describe("generateReply", () => {
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// Only the automatic seed fetch — send_reply wins outright, so the paired "77" fetch never runs.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 10);
+		expect(fetchAround).toHaveBeenCalledWith(TRIGGER.id, 100);
 	});
 
 	it("passes through a replyToMessageId that matches a known message id", async () => {
@@ -360,8 +491,8 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi", replyToMessageId: "0" }));
 		const earlier: HistoryMessage = {
 			id: "0",
-			user: "bob",
 			userId: "222",
+			author: { username: "bob", globalName: null },
 			content: "earlier message",
 			date: "2023-12-31T00:00:00.000Z",
 			replyToId: null,
@@ -381,7 +512,7 @@ describe("generateReply", () => {
 
 		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround)).rejects.toThrow(/exceeded/);
 
-		expect(fetchSpy).toHaveBeenCalledTimes(6); // MAX_GEMINI_CALLS
+		expect(fetchSpy).toHaveBeenCalledTimes(5); // MAX_GEMINI_CALLS
 	});
 
 	it("withholds fetch_message_history on the final call, forcing a conclusion", async () => {
@@ -392,7 +523,7 @@ describe("generateReply", () => {
 
 		await expect(generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround)).rejects.toThrow();
 
-		const finalCallBody = JSON.parse(fetchSpy.mock.calls[5][1]?.body as string);
+		const finalCallBody = JSON.parse(fetchSpy.mock.calls[4][1]?.body as string);
 		expect(finalCallBody.tools[0].functionDeclarations.map((d: { name: string }) => d.name)).toEqual(["send_reply"]);
 		// The final-call system instruction shouldn't reference a tool it never declares.
 		const instructionText = finalCallBody.systemInstruction.parts.map((p: { text: string }) => p.text).join(" ");
@@ -412,12 +543,12 @@ describe("generateReply", () => {
 				.systemInstruction.parts.map((part: { text: string }) => part.text)
 				.join(" ");
 
-		// Five gathering turns, not MAX_GEMINI_CALLS: the sixth call only offers send_reply.
-		expect(instructionFor(0)).toContain("You have 5 turns left to gather context");
-		expect(instructionFor(3)).toContain("You have 2 turns left to gather context");
-		expect(instructionFor(4)).toContain("This is your last turn to gather context");
-		expect(instructionFor(5)).toContain("Answer now");
-		expect(instructionFor(5)).not.toContain("gather context");
+		// Four gathering turns, not MAX_GEMINI_CALLS: the fifth call only offers send_reply.
+		expect(instructionFor(0)).toContain("You have 4 turns left to gather context");
+		expect(instructionFor(2)).toContain("You have 2 turns left to gather context");
+		expect(instructionFor(3)).toContain("This is your last turn to gather context");
+		expect(instructionFor(4)).toContain("Answer now");
+		expect(instructionFor(4)).not.toContain("gather context");
 	});
 
 	it("throws when the model doesn't call a function", async () => {

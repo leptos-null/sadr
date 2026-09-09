@@ -12,6 +12,8 @@ function message(overrides: Partial<MessageCreateDispatchData>): MessageCreateDi
 		timestamp: "2024-01-01T00:00:00.000Z",
 		author: { id: "user", username: "user" },
 		mentions: [],
+		attachments: [],
+		edited_timestamp: null,
 		...overrides,
 	};
 }
@@ -22,7 +24,9 @@ describe("isAddressedToBot", () => {
 	});
 
 	it("is true for a guild message that mentions the bot", () => {
-		expect(isAddressedToBot(message({ guild_id: "guild", mentions: [{ id: BOT_ID }] }), BOT_ID)).toBe(true);
+		expect(isAddressedToBot(message({ guild_id: "guild", mentions: [{ id: BOT_ID, username: "bot" }] }), BOT_ID)).toBe(
+			true,
+		);
 	});
 
 	it("is false for a guild message that doesn't mention the bot", () => {
@@ -30,6 +34,8 @@ describe("isAddressedToBot", () => {
 	});
 
 	it("is false for a guild message that mentions someone else", () => {
-		expect(isAddressedToBot(message({ guild_id: "guild", mentions: [{ id: "someone-else" }] }), BOT_ID)).toBe(false);
+		expect(
+			isAddressedToBot(message({ guild_id: "guild", mentions: [{ id: "someone-else", username: "someone" }] }), BOT_ID),
+		).toBe(false);
 	});
 });

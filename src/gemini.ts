@@ -3,10 +3,23 @@ import { debugLog } from "./log-level";
 const MODEL = "gemini-3.5-flash-lite";
 const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 
-/** Caps worst-case latency/cost: bounds the total number of Gemini round-trips per reply. */
-const MAX_GEMINI_CALLS = 6;
-/** Discord splits this roughly evenly before/after the anchor message. */
-const AROUND_FETCH_LIMIT = 10;
+/** Bounds worst-case latency/cost: the max Gemini round-trips per reply. */
+const MAX_GEMINI_CALLS = 5;
+/**
+ * For the automatic seed fetches (trigger and, if it's a reply, the reply target) — not model-issued.
+ * Discord splits this roughly evenly before/after the anchor message; 100 is Discord's own max.
+ */
+const SEED_FETCH_LIMIT = 100;
+/** For a model-issued `fetch_message_history` call — kept well under SEED_FETCH_LIMIT so a model that
+ *  keeps asking for more context can't run up latency/cost the way the free initial seed can. */
+const TOOL_FETCH_LIMIT = 20;
+/**
+ * Soft cap on the JSON payload's serialized length — see `buildContents`, which drops the oldest
+ * messages first until it fits, or only the newest message is left. Not a hard guarantee: `trigger`
+ * is always sent as its own payload field regardless, but that one message alone (with its own
+ * attachments/mentions) could still exceed this.
+ */
+const MAX_PAYLOAD_CHARS = 15_000;
 /**
  * Discord's hard cap on message content. Not enforced locally: the model is asked to stay within it,
  * and anything longer is rejected by Discord as a failed send.
@@ -16,19 +29,36 @@ const MAX_REPLY_LENGTH = 2000;
 const FETCH_HISTORY_FUNCTION = "fetch_message_history";
 const SEND_REPLY_FUNCTION = "send_reply";
 
+/** A user's name info, as given to Gemini via the shared `users` map rather than repeated per message. */
+export interface UserInfo {
+	username: string;
+	/** Discord's account-wide display name; null if the user hasn't set one, in which case Discord itself falls back to showing `username`. */
+	globalName: string | null;
+}
+
 /** A Discord message as given to Gemini. */
 export interface HistoryMessage {
 	id: string;
-	user: string;
 	userId: string;
+	/** This message's author. Folded into the payload's shared `users` map, not repeated on the message itself. */
+	author: UserInfo;
 	content: string;
 	/** ISO 8601 timestamp, as Discord provides it. */
 	date: string;
 	/** id of the message this one is a Discord reply to, or null if it isn't a reply. */
 	replyToId: string | null;
+	/** ISO 8601 timestamp of the message's last edit. Omitted entirely for a message never edited. */
+	editedDate?: string;
+	/** Filenames of files/images attached to the message. Omitted entirely when there are none. */
+	attachments?: string[];
+	/**
+	 * Other users `content` mentions, beyond the author — folded into `users` the same way, so a
+	 * mention of someone who hasn't posted in view can still be resolved to a name.
+	 */
+	mentionedUsers?: Array<{ id: string } & UserInfo>;
 }
 
-/** The Discord channel a reply is being generated for, or null for a DM (which has none). Topic alone can still be null for a guild channel with none set. */
+/** The Discord channel a reply is being generated for, null for a DM. Topic alone can also be null, for a channel with none set. */
 export interface ChannelInfo {
 	name: string | null;
 	topic: string | null;
@@ -76,7 +106,7 @@ interface GenerateContentResponse {
 const fetchHistoryDeclaration = {
 	name: FETCH_HISTORY_FUNCTION,
 	description:
-		`Fetch up to ${AROUND_FETCH_LIMIT} messages surrounding a message id — both before and after it. ` +
+		`Fetch up to ${TOOL_FETCH_LIMIT} messages surrounding a message id — both before and after it. ` +
 		`Use it to follow a reply chain, or to widen context around the trigger. Fetch each id at most once.`,
 	parameters: {
 		type: "object",
@@ -140,7 +170,19 @@ function buildSystemInstruction(
 
 	lines.push('"messages" is every message you currently know, oldest first, including "trigger".');
 
-	lines.push(`Each message is {"id", "user", "userId", "content", "date", "replyToId"}: "user" is a display name, "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${botUserId}" is one you sent.`);
+	lines.push(`Each message is {"id", "userId", "content", "date", "replyToId"}: "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${botUserId}" is one you sent.`);
+
+	lines.push(
+		`"users" maps every user id you might see — a message's "userId", or an id inside a raw "<@id>" or "<@!id>" mention token in "content" — to {"username", "globalName"}. Prefer "globalName" when it isn't null; otherwise use "username".`,
+	);
+
+	lines.push(
+		`A message may also have "attachments": ["filename", ...] for files or images it carries. You can't view them, but you can acknowledge them.`,
+	);
+
+	lines.push(
+		`A message may also have "editedDate" (ISO 8601) if it's been edited since it was first sent. There's no way to see what it originally said, so don't guess at the change — just be aware it happened.`,
+	);
 
 	// The budget counts down per call, so the model is told what it actually has left rather than a
 	// constant it can't act on. At 0 the wording must never name the withheld tool: each call is
@@ -165,11 +207,10 @@ function buildSystemInstruction(
 }
 
 /**
- * Every call forces a function call via `mode: "ANY"`. `gatherTurnsLeft` is how many turns still
- * offer `fetch_message_history`; at 0 it isn't declared at all (and the system instruction adjusts
- * to match, without naming it), leaving `send_reply` as the only function the model can call — which
- * is what guarantees it concludes instead of looping on fetches forever. One number drives both the
- * tool list and the instruction, so they can't disagree.
+ * Every call forces a function call via `mode: "ANY"`. `gatherTurnsLeft` drives both the declared
+ * tools and the system instruction from one number, so they can't disagree: at 0, `fetch_message_history`
+ * is left undeclared (and unnamed in the instruction, since each call is stateless), leaving
+ * `send_reply` as the only option — guaranteeing the model concludes instead of looping forever.
  */
 async function callGemini(
 	env: Env,
@@ -205,8 +246,7 @@ async function callGemini(
 	debugLog(env, () => `Gemini: response ${JSON.stringify(data)}`);
 	const candidate = data.candidates?.[0];
 	// A candidate can come back with no parts at all (finishReason MAX_TOKENS/SAFETY/RECITATION, or a
-	// blocked prompt). Naming the reason here is the difference between a diagnosable log line and a
-	// bare TypeError from reading .parts of undefined.
+	// blocked prompt) — name the reason here, or this throws an undiagnosable TypeError instead.
 	if (!candidate?.content?.parts?.length) {
 		throw new Error(
 			`Gemini generateContent returned no content parts ` +
@@ -215,6 +255,21 @@ async function callGemini(
 		);
 	}
 	return candidate.content.parts;
+}
+
+/** A `HistoryMessage` as it actually goes on the wire: `author`/`mentionedUsers` live in `users` instead. */
+function toPayloadMessage({ author: _author, mentionedUsers: _mentionedUsers, ...rest }: HistoryMessage) {
+	return rest;
+}
+
+/** Every user any of `messages` names — as an author or a mention — keyed by id for `content` to look up. */
+function collectUsers(messages: HistoryMessage[]): Record<string, UserInfo> {
+	const users: Record<string, UserInfo> = {};
+	for (const message of messages) {
+		users[message.userId] = message.author;
+		for (const { id, ...info } of message.mentionedUsers ?? []) users[id] = info;
+	}
+	return users;
 }
 
 /** Builds a single fresh turn reflecting everything currently known — no function-call scaffolding. */
@@ -228,15 +283,32 @@ function buildContents(
 	// timestamp at identical precision.
 	const messages = [...resolved.values()].sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
 
-	const payload = {
-		...(guild ? { guild } : {}),
-		...(channel ? { channel } : {}),
-		// The full trigger message, not just its id — no lookup into a (possibly large) list
-		// required to know what's actually being responded to.
-		trigger,
-		messages,
+	// Serialized size only shrinks as more of the oldest messages are cut from the front, so binary
+	// search `dropCount` for the fewest cuts that bring it under MAX_PAYLOAD_CHARS (see that constant).
+	const payloadText = (dropCount: number) => {
+		const kept = messages.slice(dropCount);
+		return JSON.stringify({
+			...(guild ? { guild } : {}),
+			...(channel ? { channel } : {}),
+			// The full trigger message, not just its id — no lookup into a (possibly large) list
+			// required to know what's actually being responded to.
+			trigger: toPayloadMessage(trigger),
+			messages: kept.map(toPayloadMessage),
+			users: collectUsers(kept),
+		});
 	};
-	return [{ role: "user", parts: [{ text: JSON.stringify(payload) }] }];
+	let lo = 0;
+	let hi = messages.length - 1; // always keep at least the newest message
+	while (lo < hi) {
+		const mid = (lo + hi) >>> 1;
+		if (payloadText(mid).length <= MAX_PAYLOAD_CHARS) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
+		}
+	}
+
+	return [{ role: "user", parts: [{ text: payloadText(lo) }] }];
 }
 
 /**
@@ -259,17 +331,18 @@ function toReplyResult(functionCall: FunctionCall, resolved: Map<string, History
 
 /**
  * Generates a reply to `trigger`. Before asking the model anything, the messages surrounding the
- * trigger — and, if the trigger is itself a reply, the messages surrounding whatever it's replying
- * to — are fetched and seeded into context: the two things a model would almost always ask for
- * anyway, done up front instead of costing it a turn. The guild's name/description (null for a DM)
- * and the channel's name/topic are fetched alongside that seeding (not on the model's request —
- * unlike message history, there's no `fetch_guild`/`fetch_channel` tool) so the model always has
- * them without spending a turn. From there the model can still call `fetch_message_history`
- * (around a message id) to pull in further context and `send_reply` once
- * ready; fetched messages accumulate in a resolved map keyed by id, and each Gemini call is given a
- * freshly rebuilt, deduped, chronological view of that map rather than an ever-growing transcript of
- * past tool calls. `fetch_message_history` is withheld on the final allowed call, forcing the model
- * to conclude with `send_reply` rather than looping on fetches and never answering.
+ * trigger are fetched and seeded into context — what a model would almost always ask for anyway,
+ * done up front instead of costing it a turn. If the trigger is itself a reply, a second fetch
+ * centred on the reply target follows, skipped when that target already turned up in the trigger's
+ * own window. The guild's name/description and the channel's name/topic (both null for a DM) are
+ * fetched alongside that seeding too — there's no `fetch_guild`/`fetch_channel` tool, so this is the
+ * model's only way to get them.
+ *
+ * From there the model can call `fetch_message_history` (around a message id) for further context
+ * and `send_reply` once ready. Fetched messages accumulate in a resolved map keyed by id, and each
+ * Gemini call gets a freshly rebuilt, deduped, chronological view of that map rather than an
+ * ever-growing transcript of past tool calls. `fetch_message_history` is withheld on the final
+ * allowed call, forcing the model to conclude with `send_reply` rather than looping forever.
  */
 export async function generateReply(
 	env: Env,
@@ -281,20 +354,24 @@ export async function generateReply(
 	fetchAround: (messageId: string, limit: number) => Promise<HistoryMessage[]>,
 ): Promise<ReplyResult> {
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
-	const fetchedAnchors = new Set<string>();
+	const fetchedAnchors = new Set<string>([trigger.id]);
 
-	// Seed the two anchors a model would almost always fetch anyway
-	const seedAnchors = trigger.replyToId ? [trigger.id, trigger.replyToId] : [trigger.id];
-	for (const anchor of seedAnchors) fetchedAnchors.add(anchor);
-
-	// Run alongside the seed fetches, not after, so neither adds its own round-trip of latency.
-	const [guild, channel, seeded] = await Promise.all([
+	// Run alongside the trigger's seed fetch, not after, so neither adds its own round-trip latency.
+	const [guild, channel, triggerAround] = await Promise.all([
 		fetchGuild(),
 		fetchChannel(),
-		Promise.all(seedAnchors.map((anchor) => fetchAround(anchor, AROUND_FETCH_LIMIT))),
+		fetchAround(trigger.id, SEED_FETCH_LIMIT),
 	]);
-	for (const around of seeded) {
-		for (const message of around) resolved.set(message.id, message);
+	for (const message of triggerAround) resolved.set(message.id, message);
+
+	// Verified live against Discord: `around` returns the anchor message itself, not just its
+	// neighbors, so `resolved` gains the reply target's id whichever fetch below ends up supplying it.
+	if (trigger.replyToId) {
+		fetchedAnchors.add(trigger.replyToId);
+		if (!resolved.has(trigger.replyToId)) {
+			const replyToAround = await fetchAround(trigger.replyToId, SEED_FETCH_LIMIT);
+			for (const message of replyToAround) resolved.set(message.id, message);
+		}
 	}
 
 	for (let call = 0; call < MAX_GEMINI_CALLS; call++) {
@@ -333,12 +410,11 @@ export async function generateReply(
 			// `||`, not `??`: also falls back to trigger.id if the model passes an empty string
 			// instead of omitting the argument.
 			const messageId = (functionCall.args?.message_id as string | undefined) || trigger.id;
-			// Re-fetching an anchor can only return what's already in `resolved`, so skip the
-			// Discord round-trip. The final call withholds this tool, so a model that keeps
-			// asking for the same anchor still terminates.
+			// Re-fetching an anchor can only return what's already in `resolved` — skip the round-trip.
+			// The final call withholds this tool, so a model that keeps re-asking still terminates.
 			if (fetchedAnchors.has(messageId)) continue;
 			fetchedAnchors.add(messageId);
-			const around = await fetchAround(messageId, AROUND_FETCH_LIMIT);
+			const around = await fetchAround(messageId, TOOL_FETCH_LIMIT);
 			for (const message of around) resolved.set(message.id, message);
 		}
 	}

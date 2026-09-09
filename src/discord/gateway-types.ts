@@ -1,4 +1,4 @@
-import type { DiscordMessage, DiscordUser } from "./types";
+import type { DiscordAttachment, DiscordMessage, DiscordUser } from "./types";
 
 /** Discord Gateway op codes actually used by this bot. */
 export const GatewayOpcode = {
@@ -50,7 +50,10 @@ export interface ReadyDispatchData {
 
 export interface MessageCreateDispatchData extends DiscordMessage {
 	channel_id: string;
-	mentions: Array<{ id: string }>;
+	/** Discord always sends these on a dispatch, unlike the optional base type (REST is more lenient). */
+	mentions: DiscordUser[];
+	attachments: DiscordAttachment[];
+	edited_timestamp: string | null;
 	/** Present for guild messages; absent for DMs. */
 	guild_id?: string;
 }
