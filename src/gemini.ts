@@ -7,15 +7,15 @@ const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 /** Bounds worst-case latency/cost: the max Gemini round-trips per reply. */
 const MAX_GEMINI_CALLS = 5;
 /**
- * For the automatic seed fetches (trigger, and the reply target if it's a reply) — not model-issued.
+ * For the automatic seed fetch around the trigger itself — not model-issued.
  * Discord splits this roughly evenly before/after the anchor message; its own max is 100.
  */
 const SEED_FETCH_LIMIT = 50;
 /**
- * For a model-issued `fetch_message_history` call, and for each Discord message-link URL resolved
- * out of the trigger's content — kept well under SEED_FETCH_LIMIT so neither a model that keeps
- * asking for more context, nor a message packed with links, can run up latency/cost the way the
- * free initial seed can.
+ * For a model-issued `fetch_message_history` call, and for the automatic fetch around the reply
+ * target when the trigger is itself a reply — context around either is about equally relevant, and
+ * both are kept well under SEED_FETCH_LIMIT so a model that keeps asking for more can't run up
+ * latency/cost the way the free initial seed can.
  */
 const TOOL_FETCH_LIMIT = 20;
 /** Caps how many message links in a single trigger get resolved, so a link-spammed message can't turn into an unbounded fan-out of fetches. */

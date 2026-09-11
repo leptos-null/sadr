@@ -7,6 +7,7 @@
     "dev": "wrangler dev",
     "start": "wrangler dev",
     "test": "vitest",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test/tsconfig.json",
     "cf-typegen": "wrangler types"
   },
   "devDependencies": {
