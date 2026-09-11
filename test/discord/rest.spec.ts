@@ -1,6 +1,7 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
+	DiscordApiError,
 	getChannelMessages,
 	getCurrentUser,
 	getGatewayBotUrl,
@@ -33,6 +34,15 @@ describe("getGatewayBotUrl", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
 
 		await expect(getGatewayBotUrl(env)).rejects.toThrow(/401/);
+	});
+
+	it("throws a DiscordApiError carrying the status, so a caller can recognize an expected failure", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Missing Access", { status: 403 }));
+
+		const error = await getGatewayBotUrl(env).catch((caught: unknown) => caught);
+
+		expect(error).toBeInstanceOf(DiscordApiError);
+		expect((error as DiscordApiError).status).toBe(403);
 	});
 });
 
@@ -105,7 +115,7 @@ describe("sendMessage", () => {
 		env.DISCORD_TOKEN = "test-discord-token";
 		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 200 }));
 
-		await sendMessage(env, "123", "hello");
+		await sendMessage(env, "123", "hello", null);
 
 		const [requestUrl, init] = fetchSpy.mock.calls[0];
 		expect(requestUrl).toBe("https://discord.com/api/v10/channels/123/messages");
@@ -134,7 +144,7 @@ describe("sendMessage", () => {
 	it("throws with response detail on failure", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
 
-		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/401/);
+		await expect(sendMessage(env, "123", "hello", null)).rejects.toThrow(/401/);
 	});
 });
 
@@ -150,7 +160,7 @@ describe("rate limit retries", () => {
 			.mockResolvedValueOnce(new Response(null, { status: 200 }));
 		vi.spyOn(console, "warn").mockImplementation(() => {});
 
-		await sendMessage(env, "123", "hello");
+		await sendMessage(env, "123", "hello", null);
 
 		expect(fetchSpy).toHaveBeenCalledTimes(2);
 	});
@@ -160,7 +170,7 @@ describe("rate limit retries", () => {
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(new Response("slow down", { status: 429, headers: { "retry-after": "" } }));
 
-		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/429/);
+		await expect(sendMessage(env, "123", "hello", null)).rejects.toThrow(/429/);
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 	});
 
@@ -169,7 +179,7 @@ describe("rate limit retries", () => {
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(new Response("slow down", { status: 429, headers: { "retry-after": "600" } }));
 
-		await expect(sendMessage(env, "123", "hello")).rejects.toThrow(/429/);
+		await expect(sendMessage(env, "123", "hello", null)).rejects.toThrow(/429/);
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 	});
 });

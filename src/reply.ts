@@ -1,4 +1,5 @@
 import {
+	DiscordApiError,
 	getChannel,
 	getChannelMessages,
 	getGuild,
@@ -78,7 +79,7 @@ export async function replyToMessage(env: Env, bot: BotIdentity, message: Messag
 	try {
 		const reply = await generateReply(env, bot, toHistoryMessage(message), createDiscordReader(env, message));
 		console.log({ message: "Reply generated, sending to channel", channelId: message.channel_id });
-		await sendMessage(env, message.channel_id, reply.content, reply.replyToMessageId ?? undefined);
+		await sendMessage(env, message.channel_id, reply.content, reply.replyToMessageId);
 	} catch (error) {
 		// Whoever addressed the bot can't tell silence from "still thinking", so always say
 		// something back — but never let the fallback's own failure escape past this log.
@@ -145,37 +146,47 @@ function createDiscordReader(env: Env, message: MessageCreateDispatchData): Disc
 			return around.map(toHistoryMessage);
 		},
 		canReadLinkedChannel: async (channelId, userId) => {
-			const channel = await getChannelCached(channelId);
-			// A link into a DM is never resolved: there's no membership/overwrite model to check it against.
-			if (!channel.guild_id) return false;
-			// A private thread's audience is an explicit member list, never as wide as a channel's, so
-			// it's never relayed into a guild reply — decided here, before paying for the round-trips below.
-			if (message.guild_id && channel.type === ChannelType.PrivateThread) return false;
-			const memberCacheKey = `${channel.guild_id}:${userId}`;
-			let memberPromise = memberCache.get(memberCacheKey);
-			if (!memberPromise) {
-				memberPromise = getGuildMember(env, channel.guild_id, userId);
-				memberCache.set(memberCacheKey, memberPromise);
+			try {
+				const channel = await getChannelCached(channelId);
+				// A link into a DM is never resolved: there's no membership/overwrite model to check it against.
+				if (!channel.guild_id) return false;
+				// A private thread's audience is an explicit member list, never as wide as a channel's, so
+				// it's never relayed into a guild reply — decided here, before paying for the round-trips below.
+				if (message.guild_id && channel.type === ChannelType.PrivateThread) return false;
+				const memberCacheKey = `${channel.guild_id}:${userId}`;
+				let memberPromise = memberCache.get(memberCacheKey);
+				if (!memberPromise) {
+					memberPromise = getGuildMember(env, channel.guild_id, userId);
+					memberCache.set(memberCacheKey, memberPromise);
+				}
+				const member = await memberPromise;
+				if (!member) return false;
+				const linked = await governingChannels(channel);
+				if (!linked) return false;
+				if (!canReadChannel(linked.governing, linked.category, userId, member.roles)) return false;
+				// Reading the parent isn't enough for a private thread: the asker must also be a member, and
+				// vice versa (see getThreadMember). Only reachable for a DM reply; the guild case returned above.
+				if (channel.type === ChannelType.PrivateThread) {
+					const threadMember = await getThreadMember(env, channel.id, userId);
+					if (!threadMember) return false;
+				}
+				// A DM reply's only audience is the asker, already cleared above. A guild reply's is the
+				// whole home channel, so the linked channel must be no narrower (see isAtLeastAsReadableAs).
+				if (!message.guild_id) return true;
+				const home = await governingChannels(await getChannelCached(message.channel_id));
+				if (!home) return false;
+				// A home channel that's itself a thread gets compared as its parent channel, i.e. as
+				// a wider audience than it really has. That over-denies rather than over-shares.
+				return isAtLeastAsReadableAs(linked.governing, linked.category, home.governing, home.category);
+			} catch (error) {
+				// A channel (or its parent/category) the bot itself can't see — 403 Missing Access, or
+				// 404 Unknown Channel when the bot isn't in that guild — is an ordinary denial, not a fault.
+				// The member lookups already answer null for a 404, so in practice these come from getChannel.
+				if (error instanceof DiscordApiError && (error.status === 403 || error.status === 404)) {
+					return false;
+				}
+				throw error;
 			}
-			const member = await memberPromise;
-			if (!member) return false;
-			const linked = await governingChannels(channel);
-			if (!linked) return false;
-			if (!canReadChannel(linked.governing, linked.category, userId, member.roles)) return false;
-			// Reading the parent isn't enough for a private thread: the asker must also be a member, and
-			// vice versa (see getThreadMember). Only reachable for a DM reply; the guild case returned above.
-			if (channel.type === ChannelType.PrivateThread) {
-				const threadMember = await getThreadMember(env, channel.id, userId);
-				if (!threadMember) return false;
-			}
-			// A DM reply's only audience is the asker, already cleared above. A guild reply's is the
-			// whole home channel, so the linked channel must be no narrower (see isAtLeastAsReadableAs).
-			if (!message.guild_id) return true;
-			const home = await governingChannels(await getChannelCached(message.channel_id));
-			if (!home) return false;
-			// A home channel that's itself a thread gets compared as its parent channel, i.e. as
-			// a wider audience than it really has. That over-denies rather than over-shares.
-			return isAtLeastAsReadableAs(linked.governing, linked.category, home.governing, home.category);
 		},
 	};
 }

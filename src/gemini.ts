@@ -92,7 +92,9 @@ export interface DiscordReader {
 	fetchAround: (channelId: string, messageId: string | null, limit: number) => Promise<HistoryMessage[]>;
 	/**
 	 * Whether a link into `channelId` may be resolved for `userId` (the trigger's author) — checked
-	 * before the channel is ever fetched. A throw counts as a denial.
+	 * before the channel is ever fetched. Answers false for every expected denial, the bot itself
+	 * not being able to see the channel included, so a throw is a genuine fault: logged, and
+	 * counted as a denial.
 	 */
 	canReadLinkedChannel: (channelId: string, userId: string) => Promise<boolean>;
 }
@@ -183,46 +185,24 @@ function buildSystemInstruction(
 	guild: GuildInfo | null,
 	gatherTurnsLeft: number,
 ): { parts: Array<{ text: string }> } {
-	const lines: Array<string> = [
+	// Only the trailing instruction differs: the 0 branch can't name the withheld tool (see callGemini).
+	const inaccessibleDescription = `A "channels" entry can also be just {"inaccessible": true} — access to it was denied, so no name/topic/messages are available for it.`;
+	const lines = [
 		`You are "${bot.username}", a Discord bot with user id "${bot.id}". Every response must be a function call.`,
 		`"trigger" is {"channelId", "messageId"} identifying the message that prompted this reply — look it up in "channels" for its content. That channel is the one you'll reply in; the remaining fields serve only as context.`,
-	];
-
-	lines.push(
 		guild
 			? '"guild" is {"name", "description"} for the Discord server this is happening in.'
 			: "This conversation is in a direct message — just you and the other person.",
-	);
-
-	lines.push(
 		'"channels" maps a Discord channel id to {"name", "topic", "messages"}: "messages" is every message you currently know from that channel, oldest first, including "trigger" itself.',
-	);
-
-	lines.push(
 		`A "channels" entry other than the one "trigger" points to came from a Discord message-link URL you were sent — a different channel with its own separate conversation, so don't assume shared context with it, and you can't reply-quote a message from it.`,
-	);
-
-	// Only the trailing instruction differs: the 0 branch can't name the withheld tool (see callGemini).
-	const inaccessibleDescription = `A "channels" entry can also be just {"inaccessible": true} — access to it was denied, so no name/topic/messages are available for it.`;
-	lines.push(
 		gatherTurnsLeft > 0
 			? `${inaccessibleDescription} Don't call ${FETCH_HISTORY_FUNCTION} on it again, and don't guess at what it might contain.`
 			: `${inaccessibleDescription} Don't guess at what it might contain.`,
-	);
-
-	lines.push(`Each message is {"id", "userId", "content", "date", "replyToId"}: "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${bot.id}" is one you sent.`);
-
-	lines.push(
+		`Each message is {"id", "userId", "content", "date", "replyToId"}: "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${bot.id}" is one you sent.`,
 		`"users" maps every user id you might see — a message's "userId", or an id inside a raw "<@id>" or "<@!id>" mention token in "content" — to {"username", "globalName"}. Prefer "globalName" when it isn't null; otherwise use "username".`,
-	);
-
-	lines.push(
 		`A message may also have "attachments": ["filename", ...] for files or images it carries. You can't view them, but you can acknowledge them.`,
-	);
-
-	lines.push(
 		`A message may also have "editedDate" (ISO 8601) if it's been edited since it was first sent. There's no way to see what it originally said, so don't guess at the change — just be aware it happened.`,
-	);
+	];
 
 	// Counts down per call, so the model is told what it actually has left. At 0 the fetch tool is
 	// withheld and must not be named (see callGemini).
@@ -407,7 +387,13 @@ export async function generateReply(
 				// DM, the check would always deny).
 				allowed:
 					channelId === trigger.channelId ||
-					(await discord.canReadLinkedChannel(channelId, trigger.userId).catch(() => false)),
+					(await discord.canReadLinkedChannel(channelId, trigger.userId).catch((error) => {
+						console.error(
+							{ message: "Gemini message-link permission check failed, treating as denied", channelId, error: errorMessage(error) },
+							error,
+						);
+						return false;
+					})),
 			})),
 		),
 	]);
@@ -434,7 +420,7 @@ export async function generateReply(
 		Promise.all(
 			allowedLinks.map(async (link) => {
 				try {
-					return await discord.fetchAround(link.channelId, link.messageId, 10);
+					return { link, messages: await discord.fetchAround(link.channelId, link.messageId, 10) };
 				} catch (error) {
 					console.error(
 						{
@@ -445,7 +431,7 @@ export async function generateReply(
 						},
 						error,
 					);
-					return [];
+					return null;
 				}
 			}),
 		),
@@ -454,24 +440,22 @@ export async function generateReply(
 	for (const message of triggerAround) {
 		resolved.set(message.id, message);
 	}
-	for (const link of allowedLinks) {
-		fetchedAnchors.add(fetchKey(link.channelId, link.messageId));
-	}
-	for (const linkedMessages of linkResults) {
-		for (const message of linkedMessages) {
+	// A failed link fetch records no anchor, so the model can still ask for that message itself.
+	for (const linkResult of linkResults) {
+		if (!linkResult) continue;
+		fetchedAnchors.add(fetchKey(linkResult.link.channelId, linkResult.link.messageId));
+		for (const message of linkResult.messages) {
 			resolved.set(message.id, message);
 		}
 	}
 
 	// Verified live against Discord: `around` returns the anchor message itself, not just its
 	// neighbors, so `resolved` gains the reply target's id whichever fetch below ends up supplying it.
-	if (trigger.replyToId) {
-		if (!resolved.has(trigger.replyToId)) {
-			fetchedAnchors.add(fetchKey(trigger.channelId, trigger.replyToId));
-			const replyToAround = await discord.fetchAround(trigger.channelId, trigger.replyToId, TOOL_FETCH_LIMIT);
-			for (const message of replyToAround) {
-				resolved.set(message.id, message);
-			}
+	if (trigger.replyToId && !resolved.has(trigger.replyToId)) {
+		fetchedAnchors.add(fetchKey(trigger.channelId, trigger.replyToId));
+		const replyToAround = await discord.fetchAround(trigger.channelId, trigger.replyToId, TOOL_FETCH_LIMIT);
+		for (const message of replyToAround) {
+			resolved.set(message.id, message);
 		}
 	}
 

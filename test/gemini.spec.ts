@@ -431,6 +431,29 @@ describe("generateReply", () => {
 		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ inaccessible: true });
 	});
 
+	it("logs a permission check that throws and marks the channel inaccessible, since the check answers every expected denial itself", async () => {
+		const linkTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: `what's this? https://discord.com/channels/999/${LINK_CHANNEL_ID}/777`,
+		};
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const throwing = () => Promise.reject(new Error("503 Service Unavailable"));
+
+		const reply = await generateReply(env, BOT, linkTrigger, { fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel: throwing });
+
+		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		expect(errorSpy.mock.calls[0][0]).toMatchObject({ channelId: LINK_CHANNEL_ID, error: "503 Service Unavailable" });
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ inaccessible: true });
+	});
+
 	it("falls back to the trigger's own channel rather than retrying a model-issued fetch for a denied link", async () => {
 		const linkTrigger: HistoryMessage = {
 			...TRIGGER,
@@ -475,6 +498,34 @@ describe("generateReply", () => {
 		const payload = JSON.parse(body.contents[0].parts[0].text);
 		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ name: CHANNEL.name, topic: CHANNEL.topic, messages: [] });
 		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "888", 20);
+	});
+
+	it("lets the model re-request a link's message itself when the seed fetch for it failed", async () => {
+		const linkTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: `https://discord.com/channels/999/${LINK_CHANNEL_ID}/777`,
+		};
+		vi.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				functionCallResponse("fetch_message_history", { channel_id: LINK_CHANNEL_ID, message_id: "777" }),
+			)
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+		let linkSeedAttempted = false;
+		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => {
+			if (messageId === "777" && !linkSeedAttempted) {
+				linkSeedAttempted = true;
+				throw new Error("500 Internal Server Error");
+			}
+			return [];
+		});
+
+		await generateReply(env, BOT, linkTrigger, { fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel });
+
+		// The failed seed never recorded its anchor, so the model's request for the same id is a
+		// real fetch — not skipped as an already-fetched anchor.
+		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 20);
+		expect(warnSpy).not.toHaveBeenCalled();
 	});
 
 	it("keeps the messages one link fetched when another link into the same channel fails", async () => {

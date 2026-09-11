@@ -21,6 +21,17 @@ const SLOW_CALL_THRESHOLD_MS = 3_000;
 const MAX_RATE_LIMIT_RETRIES = 2;
 const MAX_RATE_LIMIT_WAIT_MS = 2_000;
 
+/** A non-2xx Discord response, with the status kept inspectable so a caller can recognize an expected one (e.g. a 403 for a channel the bot can't see). */
+export class DiscordApiError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+	) {
+		super(message);
+		this.name = "DiscordApiError";
+	}
+}
+
 function authHeaders(env: Env, hasBody: boolean): HeadersInit {
 	const headers: Record<string, string> = { Authorization: `Bot ${env.DISCORD_TOKEN}` };
 	// Only meaningful when there's actually a body to describe.
@@ -82,7 +93,7 @@ function rateLimitRetryMs(response: Response): number | null {
 
 /**
  * Makes a Discord REST call with bot auth, logging the request at debug level, retrying a
- * short-lived 429, and throwing with response detail on failure. `path` is relative to `API_BASE`
+ * short-lived 429, and throwing a `DiscordApiError` on failure. `path` is relative to `API_BASE`
  * and should include any query string. With `allowMissing`, a 404 is treated as "doesn't exist"
  * rather than a failure — returns null instead of throwing, for a lookup where that's a normal,
  * expected outcome (e.g. checking whether a user is a member of a guild) rather than an error.
@@ -111,7 +122,7 @@ async function discordFetch(
 		if (retryMs === null) {
 			if (options?.allowMissing && response.status === 404) return null;
 			if (!response.ok) {
-				throw new Error(`${method} ${path} failed: ${response.status} ${await response.text()}`);
+				throw new DiscordApiError(response.status, `${method} ${path} failed: ${response.status} ${await response.text()}`);
 			}
 			return response;
 		}
@@ -122,8 +133,23 @@ async function discordFetch(
 }
 
 /** As `discordFetch`, for the endpoints that return a JSON body worth tracing. */
-async function discordJson<T>(env: Env, method: string, path: string, body?: unknown): Promise<T> {
-	const response = await discordFetch(env, method, path, body);
+async function discordJson<T>(env: Env, method: string, path: string, body?: unknown): Promise<T>;
+async function discordJson<T>(
+	env: Env,
+	method: string,
+	path: string,
+	body: unknown,
+	options: { allowMissing: true },
+): Promise<T | null>;
+async function discordJson<T>(
+	env: Env,
+	method: string,
+	path: string,
+	body?: unknown,
+	options?: { allowMissing: true },
+): Promise<T | null> {
+	const response = options ? await discordFetch(env, method, path, body, options) : await discordFetch(env, method, path, body);
+	if (!response) return null;
 	const data = (await response.json()) as T;
 	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
 	return data;
@@ -153,7 +179,7 @@ export async function sendMessage(
 	env: Env,
 	channelId: string,
 	content: string,
-	replyToMessageId?: string,
+	replyToMessageId: string | null,
 ): Promise<void> {
 	const body: Record<string, unknown> = {
 		content,
@@ -200,14 +226,8 @@ export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {
  * Fetches a guild member — for their roles, which the message-link permission check resolves channel
  * overwrites against. Null if `userId` isn't a member of `guildId`.
  */
-export async function getGuildMember(env: Env, guildId: string, userId: string): Promise<DiscordGuildMember | null> {
-	const method = "GET";
-	const path = `/guilds/${guildId}/members/${userId}`;
-	const response = await discordFetch(env, method, path, undefined, { allowMissing: true });
-	if (!response) return null;
-	const data = (await response.json()) as DiscordGuildMember;
-	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
-	return data;
+export function getGuildMember(env: Env, guildId: string, userId: string): Promise<DiscordGuildMember | null> {
+	return discordJson<DiscordGuildMember>(env, "GET", `/guilds/${guildId}/members/${userId}`, undefined, { allowMissing: true });
 }
 
 /**
@@ -220,14 +240,8 @@ export async function getGuildMember(env: Env, guildId: string, userId: string):
  * so `canReadChannel` has to pass against the parent as well. Unlike `List Thread Members`, this
  * single-user route needs no `GUILD_MEMBERS` privileged intent.
  */
-export async function getThreadMember(env: Env, threadId: string, userId: string): Promise<DiscordThreadMember | null> {
-	const method = "GET";
-	const path = `/channels/${threadId}/thread-members/${userId}`;
-	const response = await discordFetch(env, method, path, undefined, { allowMissing: true });
-	if (!response) return null;
-	const data = (await response.json()) as DiscordThreadMember;
-	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
-	return data;
+export function getThreadMember(env: Env, threadId: string, userId: string): Promise<DiscordThreadMember | null> {
+	return discordJson<DiscordThreadMember>(env, "GET", `/channels/${threadId}/thread-members/${userId}`, undefined, { allowMissing: true });
 }
 
 /**

@@ -120,8 +120,6 @@ export class DiscordGateway extends DurableObject<Env> {
 	private async handleMessage(event: MessageEvent): Promise<void> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
 		debugLog(this.env, () => ({ message: "Gateway received payload", payload }));
-		// `!= null`, not `!== null`: a frame that omits `s` entirely would otherwise set the sequence
-		// to undefined, which then passes identifyOrResume's null check and RESUMEs with seq: undefined.
 		if (payload.s != null) {
 			this.sequence = payload.s;
 			await this.ctx.storage.put("sequence", payload.s);
@@ -147,8 +145,6 @@ export class DiscordGateway extends DurableObject<Env> {
 					console.warn({ message: "Gateway invalid session, will resume" });
 				} else {
 					console.error({ message: "Gateway invalid session, not resumable (likely a bad token or invalid intents)" });
-				}
-				if (!resumable) {
 					this.sessionId = undefined;
 					this.resumeGatewayUrl = undefined;
 					this.sequence = null;
