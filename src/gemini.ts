@@ -8,9 +8,9 @@ const API_BASE = "https://generativelanguage.googleapis.com/v1beta/models";
 const MAX_GEMINI_CALLS = 5;
 /**
  * For the automatic seed fetches (trigger, and the reply target if it's a reply) — not model-issued.
- * Discord splits this roughly evenly before/after the anchor message; 100 is Discord's own max.
+ * Discord splits this roughly evenly before/after the anchor message; its own max is 100.
  */
-const SEED_FETCH_LIMIT = 100;
+const SEED_FETCH_LIMIT = 50;
 /**
  * For a model-issued `fetch_message_history` call, and for each Discord message-link URL resolved
  * out of the trigger's content — kept well under SEED_FETCH_LIMIT so neither a model that keeps
@@ -20,12 +20,6 @@ const SEED_FETCH_LIMIT = 100;
 const TOOL_FETCH_LIMIT = 20;
 /** Caps how many message links in a single trigger get resolved, so a link-spammed message can't turn into an unbounded fan-out of fetches. */
 const MAX_MESSAGE_LINKS = 3;
-/**
- * Soft cap on the JSON payload's serialized length — see `buildContents`, which drops ambient
- * context first, then the reply target/linked messages if it still doesn't fit, but never the
- * trigger itself.
- */
-const MAX_PAYLOAD_CHARS = 15_000;
 /**
  * Discord's hard cap on message content. Not enforced locally: the model is asked to stay within it,
  * and anything longer is rejected by Discord as a failed send.
@@ -142,7 +136,7 @@ const sendReplyDeclaration = {
 				// <https://ai.google.dev/api/generate-content#schema>.
 				maxLength: String(MAX_REPLY_LENGTH),
 				description:
-					`Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages. For a line break, use an actual newline character — not the two-character sequence "\\n".`,
+					`Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages. For a line break, use an actual newline character — not the two-character sequence "\\n". Avoid mentioning tool names explicitly in the message.`,
 			},
 			replyToMessageId: {
 				type: "string",
@@ -291,116 +285,51 @@ function collectUsers(messages: HistoryMessage[]): Record<string, UserInfo> {
 	return users;
 }
 
-/**
- * A "channels" map entry as it goes on the wire. When a channel is inaccessible, its name/topic/
- * messages are meaningless — omitted entirely rather than sent as null/empty alongside the flag.
- */
-type ChannelPayloadEntry = { name: string | null; topic: string | null; messages: unknown[] } | { inaccessible: true };
-
 /** Builds a single fresh turn reflecting everything currently known — no function-call scaffolding. */
 function buildContents(
 	trigger: HistoryMessage,
 	resolved: Map<string, HistoryMessage>,
 	guild: GuildInfo | null,
 	channelInfoById: Map<string, ChannelInfo | null>,
-	priorityIds: Set<string>,
 	inaccessibleChannelIds: Set<string>,
 ): Content[] {
 	// Parsed rather than compared as strings, so ordering doesn't depend on Discord rendering every
-	// timestamp at identical precision.
-	const messages = [...resolved.values()].sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
+	// timestamp at identical precision. A message from an inaccessible channel is dropped — that
+	// channel's entry omits messages entirely below, whether or not some of its messages happened to
+	// resolve before it was marked inaccessible.
+	const kept = [...resolved.values()]
+		.sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
 
-	// Anchors: trigger plus whichever priority ids actually resolved, grouped by channel — an ambient
-	// message is only ranked against anchors in its *own* channel, never another channel's, so an
-	// unrelated channel's anchor landing on a similar date can't make it look more relevant than it is.
-	// Within its own channel, distance is to the *nearest* anchor, not raw date — a linked channel's own
-	// local context sits close in time to that link's anchor even if the two channels' clocks read
-	// totally differently (e.g. trigger's channel today, the linked channel two days ago), so this keeps
-	// a linked channel's context from being wiped out purely for looking "old" next to today's
-	// conversation.
-	const anchorDatesByChannel = new Map<string, number[]>();
-	for (const id of [trigger.id, ...priorityIds]) {
-		const anchor = resolved.get(id);
-		if (!anchor) continue;
-		const dates = anchorDatesByChannel.get(anchor.channelId) ?? [];
-		dates.push(Date.parse(anchor.date));
-		anchorDatesByChannel.set(anchor.channelId, dates);
+	/** A "channels" entry as it goes on the wire — full info/messages, or {inaccessible: true}, never a mix of both. */
+	type ChannelPayloadEntry = { name: string | null; topic: string | null; messages: unknown[] };
+
+	// Seeded from every channel known to be accessible rather than only the ones with messages: a
+	// linked channel that fetched empty still needs an entry. Without one it vanishes from the payload
+	// entirely — indistinguishable to the model from a link it was never shown, and not at all the same
+	// claim as `inaccessible`.
+	const accessibleChannels: Record<string, ChannelPayloadEntry> = {};
+	for (const [channelId, info] of channelInfoById) {
+		if (inaccessibleChannelIds.has(channelId)) continue;
+		accessibleChannels[channelId] = { name: info?.name ?? null, topic: info?.topic ?? null, messages: [] };
 	}
-	const distanceToNearestAnchor = (message: HistoryMessage) => {
-		// Every channel a message can come from already has its own anchor — the trigger for its own
-		// channel, or a link's own message for a linked one — so the empty-list fallback (Math.min()
-		// spread over nothing is Infinity, per spec) is defensive only.
-		const anchorDates = anchorDatesByChannel.get(message.channelId) ?? [];
-		return Math.min(...anchorDates.map((anchorDate) => Math.abs(Date.parse(message.date) - anchorDate)));
-	};
-
-	// Everyone but the trigger, ranked from most to least droppable: ambient messages (farthest from
-	// any anchor first), then `priorityIds` (the reply target and linked messages — oldest first) only
-	// once every ambient message is already gone. `trigger` itself never appears here — it's always
-	// kept, since the wire payload's `trigger` pointer would dangle otherwise. An id/tier pair rather
-	// than a numeric score, so there's no float-precision drift to worry about over a long list.
-	const droppable = messages
-		.filter((message) => message.id !== trigger.id)
-		.sort((a, b) => {
-			const tierA = priorityIds.has(a.id) ? 1 : 0;
-			const tierB = priorityIds.has(b.id) ? 1 : 0;
-			if (tierA !== tierB) return tierA - tierB;
-			return tierA === 0
-				? distanceToNearestAnchor(b) - distanceToNearestAnchor(a)
-				: Date.parse(a.date) - Date.parse(b.date);
-		});
-
-	// Serialized size only shrinks as more of `droppable`'s front (its most droppable end) is cut, so
-	// binary search `dropCount` for the fewest cuts that bring it under MAX_PAYLOAD_CHARS.
-	const payloadText = (dropCount: number) => {
-		const droppedIds = new Set(droppable.slice(0, dropCount).map((message) => message.id));
-		// Filtered from the already-chronological `messages`, not reassembled from `droppable`, so each
-		// channel's messages stay oldest-first despite the drop order being tier-first. A message from an
-		// inaccessible channel is dropped here too — that channel's entry omits messages entirely below,
-		// whether or not some of its messages happened to resolve before it was marked inaccessible.
-		const kept = messages.filter(
-			(message) => !droppedIds.has(message.id) && !inaccessibleChannelIds.has(message.channelId),
-		);
-		// Seeded from every channel known to be accessible rather than only the ones with messages left
-		// after trimming: a linked channel that fetched empty, or whose messages were all trimmed away,
-		// still needs an entry. Without one it vanishes from the payload entirely — indistinguishable to
-		// the model from a link it was never shown, and not at all the same claim as `inaccessible`.
-		const accessibleChannels: Record<string, { name: string | null; topic: string | null; messages: unknown[] }> = {};
-		for (const [channelId, info] of channelInfoById) {
-			if (inaccessibleChannelIds.has(channelId)) continue;
-			accessibleChannels[channelId] = { name: info?.name ?? null, topic: info?.topic ?? null, messages: [] };
-		}
-		for (const message of kept) {
-			const channel = accessibleChannels[message.channelId];
-			// Defensive only: messages are fetched from exactly the channels `channelInfoById` covers, and
-			// `kept` has already dropped every inaccessible channel's.
-			if (!channel) continue;
-			channel.messages.push(toPayloadMessage(message));
-		}
-		const channels: Record<string, ChannelPayloadEntry> = { ...accessibleChannels };
-		for (const channelId of inaccessibleChannelIds) {
-			channels[channelId] = { inaccessible: true };
-		}
-		return JSON.stringify({
-			...(guild ? { guild } : {}),
-			channels,
-			trigger: { channelId: trigger.channelId, messageId: trigger.id },
-			users: collectUsers(kept),
-		});
-	};
-
-	let lo = 0;
-	let hi = droppable.length; // can drop everything droppable — the trigger alone is the floor
-	while (lo < hi) {
-		const mid = (lo + hi) >>> 1;
-		if (payloadText(mid).length <= MAX_PAYLOAD_CHARS) {
-			hi = mid;
-		} else {
-			lo = mid + 1;
-		}
+	for (const message of kept) {
+		const channel = accessibleChannels[message.channelId];
+		// This is what actually drops an inaccessible channel's messages — `kept` itself isn't filtered.
+		if (!channel) continue;
+		channel.messages.push(toPayloadMessage(message));
 	}
+	const channels: Record<string, ChannelPayloadEntry | { inaccessible: true }> = { ...accessibleChannels };
+	for (const channelId of inaccessibleChannelIds) {
+		channels[channelId] = { inaccessible: true };
+	}
+	const payloadText = JSON.stringify({
+		...(guild ? { guild } : {}),
+		channels,
+		trigger: { channelId: trigger.channelId, messageId: trigger.id },
+		users: collectUsers(kept),
+	});
 
-	return [{ role: "user", parts: [{ text: payloadText(lo) }] }];
+	return [{ role: "user", parts: [{ text: payloadText }] }];
 }
 
 /**
@@ -477,76 +406,90 @@ export async function generateReply(
 	const fetchKey = (channelId: string, messageId: string | null) => `${channelId}:${messageId ?? ""}`;
 	const fetchedAnchors = new Set<string>([fetchKey(trigger.channelId, trigger.id)]);
 	const candidateLinks = extractMessageLinks(trigger.content).slice(0, MAX_MESSAGE_LINKS);
+	// Deduped by channel before checking access — a message can link into the same channel more than
+	// once, and checking each link individually would both waste round-trips and risk two checks for
+	// the same channel coming back with different answers (e.g. one transient failure caught as a
+	// denial while the other succeeds).
+	const candidateChannelIds = [...new Set(candidateLinks.map((link) => link.channelId))];
 	// The permission checks gate the channel-set-dependent batch further down, but neither the guild
-	// fetch nor the trigger's own seed fetch depends on which links survive them — so all three run
+	// fetch nor the trigger's own seed fetch depends on which channels survive them — so all three run
 	// together rather than the checks running first. A single check can cost several *sequential*
 	// Discord round-trips (the linked channel, the asker's guild membership, a thread's parent and then
 	// that parent's category), every one of which would otherwise sit in front of the seed fetch.
-	const [guild, triggerAround, linkChecks] = await Promise.all([
+	const [guild, triggerAround, channelChecks] = await Promise.all([
 		fetchGuild(),
 		fetchAround(trigger.channelId, trigger.id, SEED_FETCH_LIMIT),
 		Promise.all(
-			candidateLinks.map(async (link) => ({
-				link,
+			candidateChannelIds.map(async (channelId) => ({
+				channelId,
 				// A link back into the trigger's own channel needs no permission check — the bot is already
 				// conversing there (and, for a DM, there's no guild for canReadLinkedChannel to check against,
 				// so without this it would wrongly deny a self-link every time).
 				allowed:
-					link.channelId === trigger.channelId ||
-					(await canReadLinkedChannel(link.channelId, trigger.userId).catch(() => false)),
+					channelId === trigger.channelId ||
+					(await canReadLinkedChannel(channelId, trigger.userId).catch(() => false)),
 			})),
 		),
 	]);
-	const links = linkChecks.filter((check) => check.allowed).map((check) => check.link);
-	const deniedChannelIds = new Set(linkChecks.filter((check) => !check.allowed).map((check) => check.link.channelId));
-	const channelIds = [...new Set([trigger.channelId, ...links.map((link) => link.channelId)])];
-	// What the trigger is a reply to, and what it links to — see buildContents' trimming, which keeps
-	// these over ambient context once the payload needs to shrink.
-	const priorityIds = new Set(links.map((link) => link.messageId));
-	if (trigger.replyToId) priorityIds.add(trigger.replyToId);
+	const allowedChannelIds = new Set(channelChecks.filter((check) => check.allowed).map((check) => check.channelId));
+	const deniedChannelIds = new Set(channelChecks.filter((check) => !check.allowed).map((check) => check.channelId));
+	const allowedLinks = candidateLinks.filter((link) => allowedChannelIds.has(link.channelId));
+	const channelIds = [...new Set([trigger.channelId, ...allowedChannelIds])];
 
-	// The two that genuinely needed the surviving channel set, run as one batch. A channel the bot
-	// can't see (wrong guild, no permission, deleted message) shouldn't fail the whole reply — that
-	// channel/link just contributes nothing, but (unlike a denied link) does still need to be flagged
-	// inaccessible below, since its channelId already passed the permission check and stays reachable
-	// via a model-issued channel_id.
-	const [channelResults, linkResults] = await Promise.all([
-		Promise.all(
-			channelIds.map(async (id) => {
-				try {
-					return { id, info: await fetchChannel(id), failed: false };
-				} catch (error) {
-					console.error(`Gemini: failed to fetch channel ${id}: ${errorMessage(error)}`, error);
-					return { id, info: null, failed: true };
-				}
-			}),
-		),
-		Promise.all(
-			links.map(async (link) => {
-				try {
-					return { channelId: link.channelId, messages: await fetchAround(link.channelId, link.messageId, TOOL_FETCH_LIMIT), failed: false };
-				} catch (error) {
-					console.error(`Gemini: failed to fetch linked message ${link.messageId} in channel ${link.channelId}: ${errorMessage(error)}`, error);
-					return { channelId: link.channelId, messages: [] as HistoryMessage[], failed: true };
-				}
-			}),
-		),
-	]);
+	// Channel info is fetched and awaited in full before any linked channel's messages: a channel whose
+	// own info fetch failed is going to be marked inaccessible below regardless, so there's nothing to
+	// gain — and a wasted round-trip to avoid — from also fetching its messages.
+	const channelResults = await Promise.all(
+		channelIds.map(async (id) => {
+			try {
+				return { id, info: await fetchChannel(id), failed: false };
+			} catch (error) {
+				console.error(`Gemini: failed to fetch channel ${id}: ${errorMessage(error)}`, error);
+				return { id, info: null, failed: true };
+			}
+		}),
+	);
 	const channelInfoById = new Map(channelResults.map((result) => [result.id, result.info] as const));
-	for (const message of triggerAround) resolved.set(message.id, message);
+	const failedChannelIds = new Set(channelResults.filter((result) => result.failed).map((result) => result.id));
+	for (const message of triggerAround) {
+		resolved.set(message.id, message);
+	}
 
-	for (const link of links) fetchedAnchors.add(fetchKey(link.channelId, link.messageId));
+	// A channel the bot can't see (wrong guild, no permission, deleted message) shouldn't fail the
+	// whole reply — that link just contributes nothing, but (unlike a denied link) does still need to
+	// be flagged inaccessible below, since its channelId already passed the permission check and stays
+	// reachable via a model-issued channel_id.
+	const linkResults = await Promise.all(
+		allowedLinks.map(async (link) => {
+			if (failedChannelIds.has(link.channelId)) {
+				return { channelId: link.channelId, messages: [] as HistoryMessage[], failed: true };
+			}
+			try {
+				return {
+					channelId: link.channelId,
+					messages: await fetchAround(link.channelId, link.messageId, 10),
+					failed: false,
+				};
+			} catch (error) {
+				console.error(`Gemini: failed to fetch linked message ${link.messageId} in channel ${link.channelId}: ${errorMessage(error)}`, error);
+				return { channelId: link.channelId, messages: [] as HistoryMessage[], failed: true };
+			}
+		}),
+	);
+	for (const link of allowedLinks) {
+		fetchedAnchors.add(fetchKey(link.channelId, link.messageId));
+	}
 	for (const result of linkResults) {
 		for (const message of result.messages) resolved.set(message.id, message);
 	}
 
-	// A channel is inaccessible if its link was denied outright, or if either its channel-info or its
-	// message fetch failed after passing the permission check — except the trigger's own channel, which
-	// is always resolved via the primary seed fetch above regardless of these auxiliary calls (e.g. a
-	// DM self-link, or a transient failure fetching its own name/topic).
+	// A channel is inaccessible if its link was denied outright, if its channel-info fetch failed, or
+	// if its message fetch failed despite the channel info succeeding — except the trigger's own
+	// channel, which is always resolved via the primary seed fetch above regardless of these auxiliary
+	// calls (e.g. a DM self-link, or a transient failure fetching its own name/topic).
 	const inaccessibleChannelIds = new Set([
 		...deniedChannelIds,
-		...channelResults.filter((result) => result.failed).map((result) => result.id),
+		...failedChannelIds,
 		...linkResults.filter((result) => result.failed).map((result) => result.channelId),
 	]);
 	inaccessibleChannelIds.delete(trigger.channelId);
@@ -554,10 +497,12 @@ export async function generateReply(
 	// Verified live against Discord: `around` returns the anchor message itself, not just its
 	// neighbors, so `resolved` gains the reply target's id whichever fetch below ends up supplying it.
 	if (trigger.replyToId) {
-		fetchedAnchors.add(fetchKey(trigger.channelId, trigger.replyToId));
 		if (!resolved.has(trigger.replyToId)) {
-			const replyToAround = await fetchAround(trigger.channelId, trigger.replyToId, SEED_FETCH_LIMIT);
-			for (const message of replyToAround) resolved.set(message.id, message);
+			fetchedAnchors.add(fetchKey(trigger.channelId, trigger.replyToId));
+			const replyToAround = await fetchAround(trigger.channelId, trigger.replyToId, TOOL_FETCH_LIMIT);
+			for (const message of replyToAround) {
+				resolved.set(message.id, message);
+			}
 		}
 	}
 
@@ -566,7 +511,7 @@ export async function generateReply(
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
 		const parts = await callGemini(
 			env,
-			buildContents(trigger, resolved, guild, channelInfoById, priorityIds, inaccessibleChannelIds),
+			buildContents(trigger, resolved, guild, channelInfoById, inaccessibleChannelIds),
 			botUserId,
 			botUsername,
 			guild,
@@ -583,16 +528,16 @@ export async function generateReply(
 
 		// send_reply ends the turn, so it wins outright if the model paired it with fetches.
 		const sendReply = functionCalls.find((functionCall) => functionCall.name === SEND_REPLY_FUNCTION);
-		if (sendReply) return toReplyResult(sendReply, resolved, trigger.channelId);
-
-		// Checked before any fetch runs, so an unrecognised call can't leave a Discord round-trip
-		// behind on its way out.
-		const unknownCall = functionCalls.find((functionCall) => functionCall.name !== FETCH_HISTORY_FUNCTION);
-		if (unknownCall) {
-			throw new Error(`Gemini called an unknown function: ${JSON.stringify(unknownCall)}`);
+		if (sendReply) {
+			return toReplyResult(sendReply, resolved, trigger.channelId);
 		}
 
 		for (const functionCall of functionCalls) {
+			if (functionCall.name !== FETCH_HISTORY_FUNCTION) {
+				console.error(`Gemini called an unknown function: ${JSON.stringify(functionCall)}`);
+				continue;
+			}
+
 			// Only a channel already introduced via "channels" is reachable — a hallucinated or
 			// otherwise unknown id falls back to the trigger's own channel rather than reaching
 			// somewhere the model was never actually shown. An inaccessible channel falls back the same
@@ -610,10 +555,15 @@ export async function generateReply(
 			// skip the round-trip. The final call withholds this tool, so a model that keeps re-asking
 			// still terminates.
 			const key = fetchKey(channelId, messageId);
-			if (fetchedAnchors.has(key)) continue;
+			if (fetchedAnchors.has(key)) {
+				console.warn(`Gemini re-requested an already-fetched anchor: ${key}`);
+				continue;
+			}
 			fetchedAnchors.add(key);
 			const around = await fetchAround(channelId, messageId, TOOL_FETCH_LIMIT);
-			for (const message of around) resolved.set(message.id, message);
+			for (const message of around) {
+				resolved.set(message.id, message);
+			}
 		}
 	}
 

@@ -104,7 +104,7 @@ describe("generateReply", () => {
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// The automatic seed fetch around the trigger, not a model-issued call.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, TRIGGER.id, 100);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, TRIGGER.id, 50);
 		expect(fetchSpy).toHaveBeenCalledTimes(1);
 
 		const [requestUrl, init] = fetchSpy.mock.calls[0];
@@ -180,197 +180,6 @@ describe("generateReply", () => {
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const { users } = JSON.parse(body.contents[0].parts[0].text);
 		expect(users["555"]).toEqual({ username: "carol", globalName: "Carol C." });
-	});
-
-	it("trims oldest context first when the payload would exceed the size budget", async () => {
-		const fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
-		// 30 messages of 1000 chars each, all before TRIGGER's date, comfortably exceeds gemini.ts's
-		// 15k-char MAX_PAYLOAD_CHARS.
-		const bulky: HistoryMessage[] = Array.from({ length: 30 }, (_, index) => ({
-			id: `bulk-${index}`,
-			channelId: HOME_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: new Date(Date.parse("2023-12-01T00:00:00.000Z") + index * 60_000).toISOString(),
-			replyToId: null,
-		}));
-		const fetchAround = vi.fn().mockResolvedValue(bulky);
-
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, TRIGGER, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel);
-
-		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		const text = body.contents[0].parts[0].text as string;
-		const { messages } = JSON.parse(text).channels[HOME_CHANNEL_ID];
-
-		expect(text.length).toBeLessThanOrEqual(15_000);
-		// Dropped from the oldest end first...
-		expect(messages.some((message: HistoryMessage) => message.id === "bulk-0")).toBe(false);
-		// ...but the trigger and the most recent context survive.
-		expect(messages.some((message: HistoryMessage) => message.id === TRIGGER.id)).toBe(true);
-		expect(messages.some((message: HistoryMessage) => message.id === "bulk-29")).toBe(true);
-	});
-
-	it("keeps the reply target over ambient context when trimming, even though it's the oldest message", async () => {
-		const fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
-		const replyTrigger: HistoryMessage = { ...TRIGGER, replyToId: "reply-target" };
-		// Chronologically the oldest message of all — pure oldest-first trimming would cut it before
-		// any of the ambient "bulky" messages below.
-		const replyTarget: HistoryMessage = {
-			id: "reply-target",
-			channelId: HOME_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: "2023-11-01T00:00:00.000Z",
-			replyToId: null,
-		};
-		const bulky: HistoryMessage[] = Array.from({ length: 30 }, (_, index) => ({
-			id: `bulk-${index}`,
-			channelId: HOME_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: new Date(Date.parse("2023-12-01T00:00:00.000Z") + index * 60_000).toISOString(),
-			replyToId: null,
-		}));
-		// Keyed by anchor: the trigger's own seed fetch returns the ambient messages, and the separate
-		// reply-target seed fetch returns the target itself.
-		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) =>
-			messageId === "reply-target" ? [replyTarget] : bulky,
-		);
-
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel);
-
-		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		const { messages } = JSON.parse(body.contents[0].parts[0].text).channels[HOME_CHANNEL_ID];
-
-		expect(messages.some((message: HistoryMessage) => message.id === "reply-target")).toBe(true);
-		// Which specific bulky message goes first is covered by the ambient-only trimming test below —
-		// here we only care that the priority tier (the reply target) outranks ambient regardless of age.
-		const bulkyCount = messages.filter((message: HistoryMessage) => message.id.startsWith("bulk-")).length;
-		expect(bulkyCount).toBeLessThan(30);
-	});
-
-	it("protects a linked channel's own local context from a more chronologically active home channel", async () => {
-		const fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
-		const linkTrigger: HistoryMessage = {
-			...TRIGGER,
-			date: "2024-01-03T00:00:00.000Z",
-			content: `what's this? https://discord.com/channels/999/${LINK_CHANNEL_ID}/3000`,
-		};
-		const linkAnchor: HistoryMessage = {
-			id: "3000",
-			channelId: LINK_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: "2024-01-01T00:00:00.000Z", // 2 days before the trigger's own channel
-			replyToId: null,
-		};
-		const linkNeighbor: HistoryMessage = {
-			id: "link-neighbor",
-			channelId: LINK_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: "2024-01-01T00:01:00.000Z", // 1 minute after its own anchor — a close local neighbor
-			replyToId: null,
-		};
-		// The home channel's own ambient context, spread from 1 to 20 minutes after the trigger —
-		// chronologically more recent than the linked channel, but farther from any anchor.
-		const homeBulky: HistoryMessage[] = Array.from({ length: 20 }, (_, index) => ({
-			id: `home-${index}`,
-			channelId: HOME_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: new Date(Date.parse(linkTrigger.date) + (index + 1) * 60_000).toISOString(),
-			replyToId: null,
-		}));
-		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) =>
-			messageId === "3000" ? [linkAnchor, linkNeighbor] : homeBulky,
-		);
-
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, linkTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel);
-
-		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		const payload = JSON.parse(body.contents[0].parts[0].text);
-
-		// The linked channel's own close neighbor survives despite being 2 calendar days "older" than
-		// every home-channel message...
-		expect(payload.channels[LINK_CHANNEL_ID].messages.some((message: HistoryMessage) => message.id === "link-neighbor")).toBe(
-			true,
-		);
-		// ...while the home channel's farthest-from-trigger ambient message is trimmed instead, even
-		// though it's chronologically more recent than the linked channel's context.
-		expect(payload.channels[HOME_CHANNEL_ID].messages.some((message: HistoryMessage) => message.id === "home-19")).toBe(
-			false,
-		);
-	});
-
-	it("judges an ambient message against its own channel's anchor, not a coincidentally nearby anchor from another channel", async () => {
-		const fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
-		const linkTrigger: HistoryMessage = {
-			...TRIGGER,
-			date: "2024-02-01T00:00:00.000Z",
-			content: `what's this? https://discord.com/channels/999/${LINK_CHANNEL_ID}/5000`,
-		};
-		const linkAnchor: HistoryMessage = {
-			id: "5000",
-			channelId: LINK_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: "2024-01-01T00:00:00.000Z", // a month before the trigger's own channel
-			replyToId: null,
-		};
-		// In the home channel, but dated right next to the *linked* channel's anchor rather than its own
-		// (trigger's date is a month away) — a message should never look relevant just because some
-		// other channel's anchor happens to land on a similar date.
-		const homeDecoy: HistoryMessage = {
-			id: "home-decoy",
-			channelId: HOME_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: "2024-01-01T00:00:30.000Z", // 30s from the link anchor, ~a month from the trigger
-			replyToId: null,
-		};
-		// The home channel's own genuinely-close context, spread across the minute after the trigger.
-		const homeNear: HistoryMessage[] = Array.from({ length: 25 }, (_, index) => ({
-			id: `home-near-${index}`,
-			channelId: HOME_CHANNEL_ID,
-			userId: "222",
-			author: { username: "bob", globalName: null },
-			content: "x".repeat(1000),
-			date: new Date(Date.parse(linkTrigger.date) + (index + 1) * 1_000).toISOString(),
-			replyToId: null,
-		}));
-		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) =>
-			messageId === "5000" ? [linkAnchor] : [homeDecoy, ...homeNear],
-		);
-
-		await generateReply(env, BOT_USER_ID, BOT_USERNAME, linkTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel);
-
-		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
-		const payload = JSON.parse(body.contents[0].parts[0].text);
-		const homeMessageIds = payload.channels[HOME_CHANNEL_ID].messages.map((message: HistoryMessage) => message.id);
-
-		// home-decoy is genuinely a month from its own channel's only anchor (the trigger) — the least
-		// relevant home-channel message by far — so it's trimmed first, even though it happens to sit 30
-		// seconds from the (unrelated) linked channel's anchor.
-		expect(homeMessageIds).not.toContain("home-decoy");
-		// Meanwhile the home channel's actually-close context, seconds from the trigger, survives.
-		expect(homeMessageIds).toContain("home-near-0");
 	});
 
 	it("passes a channel with a null topic through as-is", async () => {
@@ -455,7 +264,7 @@ describe("generateReply", () => {
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, TRIGGER.id, 100);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, TRIGGER.id, 50);
 		// The seeded message actually reached the model on its very first call, not just the fetch itself.
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		expect(JSON.parse(body.contents[0].parts[0].text).channels).toEqual(
@@ -473,8 +282,8 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, replyTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel);
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, replyTrigger.id, 100);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, "42", 100);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, replyTrigger.id, 50);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, "42", 20);
 	});
 
 	it("skips the reply-target fetch when the trigger's own window already contains it", async () => {
@@ -498,7 +307,7 @@ describe("generateReply", () => {
 		// Only the trigger's own seed fetch — "42" already came back in that window, so the
 		// second round-trip is skipped entirely.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, replyTrigger.id, 100);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, replyTrigger.id, 50);
 	});
 
 	it("resolves a Discord message link in the trigger's content from its linked channel", async () => {
@@ -523,7 +332,7 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, linkTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel);
 
 		// Resolved from the link's own channel, not the trigger's.
-		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 20);
+		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
 		expect(payload.channels[LINK_CHANNEL_ID].messages).toEqual([payloadMessage(linked)]);
@@ -613,7 +422,7 @@ describe("generateReply", () => {
 
 		// Only the trigger's own seed fetch — the link's channel/message fetches never happen at all.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, linkTrigger.id, 100);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, linkTrigger.id, 50);
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
 		// Present so the model knows the link was tried and failed, rather than silently absent — which
@@ -666,6 +475,27 @@ describe("generateReply", () => {
 		const secondBody = JSON.parse(secondFetchSpy.mock.calls[1][1]?.body as string);
 		const payload = JSON.parse(secondBody.contents[0].parts[0].text);
 		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ inaccessible: true });
+	});
+
+	it("never fetches a linked channel's messages when its channel-info fetch fails", async () => {
+		const linkTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: `https://discord.com/channels/999/${LINK_CHANNEL_ID}/777`,
+		};
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }),
+		);
+		const failingFetchChannel = vi.fn((id: string) =>
+			id === LINK_CHANNEL_ID ? Promise.reject(new Error("403 Missing Access")) : Promise.resolve(CHANNEL),
+		);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, linkTrigger, fetchGuild, failingFetchChannel, fetchAround, canReadLinkedChannel);
+
+		// Only the trigger's own seed fetch — the linked channel is already known to be inaccessible by
+		// the time its messages would otherwise be fetched, so that round-trip is skipped entirely.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		expect(fetchAround).not.toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
 	});
 
 	it("never marks the trigger's own channel inaccessible, even when a self-link would otherwise be denied", async () => {
@@ -729,6 +559,23 @@ describe("generateReply", () => {
 		await generateReply(env, BOT_USER_ID, BOT_USERNAME, linkTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannelSpy);
 
 		expect(canReadLinkedChannelSpy).toHaveBeenCalledWith(LINK_CHANNEL_ID, "555");
+	});
+
+	it("checks channel access only once when multiple links point into the same channel", async () => {
+		const linkTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: `https://discord.com/channels/999/${LINK_CHANNEL_ID}/777 https://discord.com/channels/999/${LINK_CHANNEL_ID}/778`,
+		};
+		vi.spyOn(globalThis, "fetch").mockResolvedValue(
+			functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }),
+		);
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const canReadLinkedChannelSpy = vi.fn().mockResolvedValue(true);
+
+		await generateReply(env, BOT_USER_ID, BOT_USERNAME, linkTrigger, fetchGuild, fetchChannel, fetchAround, canReadLinkedChannelSpy);
+
+		// One permission check per channel, not per link — both links share LINK_CHANNEL_ID.
+		expect(canReadLinkedChannelSpy).toHaveBeenCalledTimes(1);
 	});
 
 	it("merges a message link that points back into the trigger's own channel", async () => {
@@ -980,7 +827,7 @@ describe("generateReply", () => {
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// Only the automatic seed fetch — send_reply wins outright, so the paired "77" fetch never runs.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, TRIGGER.id, 100);
+		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, TRIGGER.id, 50);
 	});
 
 	it("passes through a replyToMessageId that matches a known message id", async () => {
