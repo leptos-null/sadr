@@ -124,7 +124,7 @@ export class DiscordGateway extends DurableObject<Env> {
 		try {
 			await this.connectIfNeeded();
 		} catch (error) {
-			console.error(`Gateway: alarm's connect attempt failed: ${errorMessage(error)}`, error);
+			console.error({ message: "Gateway alarm's connect attempt failed", error: errorMessage(error) }, error);
 		} finally {
 			await this.ctx.storage.setAlarm(Date.now() + KEEPALIVE_INTERVAL_MS);
 		}
@@ -146,24 +146,24 @@ export class DiscordGateway extends DurableObject<Env> {
 		}
 		const resuming = Boolean(this.resumeGatewayUrl && this.sessionId);
 		const url = resuming ? this.resumeGatewayUrl! : await getGatewayBotUrl(this.env);
-		console.log(`Gateway: connecting (${resuming ? "resume" : "fresh"}) to ${url}`);
+		console.log({ message: "Gateway connecting", mode: resuming ? "resume" : "fresh", url });
 		const ws = new WebSocket(`${url}?v=10&encoding=json`);
 		// Guard every handler against events from a socket this DO has since moved on from
 		// (e.g. the old socket's belated "close" after a Reconnect already opened a new one).
 		ws.addEventListener("message", (event) => {
 			if (this.ws !== ws) return;
 			this.handleMessage(event).catch((error) =>
-				console.error(`Gateway: error handling message: ${errorMessage(error)}`, error),
+				console.error({ message: "Gateway error handling message", error: errorMessage(error) }, error),
 			);
 		});
 		ws.addEventListener("close", (event) => {
 			if (this.ws !== ws) return;
-			console.warn(`Gateway: closed (code ${event.code}, reason "${event.reason}")`);
+			console.warn({ message: "Gateway closed", code: event.code, reason: event.reason });
 			this.handleClose();
 		});
 		ws.addEventListener("error", (event) => {
 			if (this.ws !== ws) return;
-			console.error("Gateway: socket error", event);
+			console.error({ message: "Gateway socket error" }, event);
 			this.handleClose();
 		});
 		this.ws = ws;
@@ -179,7 +179,7 @@ export class DiscordGateway extends DurableObject<Env> {
 
 	private async handleMessage(event: MessageEvent): Promise<void> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
-		debugLog(this.env, () => `Gateway: recv ${JSON.stringify(payload)}`);
+		debugLog(this.env, () => ({ message: "Gateway received payload", payload }));
 		// `!= null`, not `!== null`: a frame that omits `s` entirely would otherwise set the sequence
 		// to undefined, which then passes identifyOrResume's null check and RESUMEs with seq: undefined.
 		if (payload.s != null) {
@@ -189,7 +189,7 @@ export class DiscordGateway extends DurableObject<Env> {
 
 		switch (payload.op) {
 			case GatewayOpcode.Hello:
-				console.log("Gateway: received Hello");
+				console.log({ message: "Gateway received Hello" });
 				this.startHeartbeat((payload.d as HelloData).heartbeat_interval);
 				await this.identifyOrResume();
 				break;
@@ -197,16 +197,16 @@ export class DiscordGateway extends DurableObject<Env> {
 				this.sendHeartbeat();
 				break;
 			case GatewayOpcode.Reconnect:
-				console.log("Gateway: told to reconnect");
+				console.log({ message: "Gateway told to reconnect" });
 				this.ws?.close();
 				await this.connectToGateway();
 				break;
 			case GatewayOpcode.InvalidSession: {
 				const resumable = payload.d as boolean;
 				if (resumable) {
-					console.warn("Gateway: invalid session, will resume");
+					console.warn({ message: "Gateway invalid session, will resume" });
 				} else {
-					console.error("Gateway: invalid session, not resumable (likely a bad token or invalid intents)");
+					console.error({ message: "Gateway invalid session, not resumable (likely a bad token or invalid intents)" });
 				}
 				if (!resumable) {
 					this.sessionId = undefined;
@@ -230,7 +230,7 @@ export class DiscordGateway extends DurableObject<Env> {
 		switch (payload.t) {
 			case "READY": {
 				const ready = payload.d as ReadyDispatchData;
-				console.log(`Gateway: READY as user ${ready.user.id}`);
+				console.log({ message: "Gateway READY", userId: ready.user.id });
 				this.sessionId = ready.session_id;
 				this.resumeGatewayUrl = ready.resume_gateway_url;
 				this.botUserId = ready.user.id;
@@ -249,11 +249,11 @@ export class DiscordGateway extends DurableObject<Env> {
 				if (!this.botUserId || !this.botUsername) {
 					// Shouldn't happen in practice — connectToGateway() resolves identity via REST before
 					// the socket even opens — but kept as defense-in-depth.
-					console.warn("Gateway: MESSAGE_CREATE with no bot identity resolved yet, skipping");
+					console.warn({ message: "Gateway MESSAGE_CREATE with no bot identity resolved yet, skipping" });
 					return;
 				}
 				if (!isAddressedToBot(message, this.botUserId)) return;
-				debugLog(this.env, () => `Gateway: received message '${message.content}'`);
+				debugLog(this.env, () => ({ message: "Gateway received message", content: message.content }));
 				const stopTyping = this.startTyping(message.channel_id);
 				// Scoped to this one reply, not the DO instance — every message-link permission check
 				// this reply resolves shares it, so linking multiple messages from the same guild only
@@ -370,14 +370,20 @@ export class DiscordGateway extends DurableObject<Env> {
 							return isAtLeastAsReadableAs(linked.governing, linked.category, home.governing, home.category);
 						},
 					);
-					console.log(`Gateway: generated reply, sending to channel ${message.channel_id}`);
+					console.log({ message: "Gateway generated reply, sending to channel", channelId: message.channel_id });
 					await sendMessage(this.env, message.channel_id, reply.content, reply.replyToMessageId ?? undefined);
 				} catch (error) {
 					// Whoever addressed the bot can't tell silence from "still thinking", so always say
 					// something back — but never let the fallback's own failure escape past this log.
-					console.error(`Gateway: failed to reply to message ${message.id}: ${errorMessage(error)}`, error);
+					console.error(
+						{ message: "Gateway failed to reply to message", messageId: message.id, error: errorMessage(error) },
+						error,
+					);
 					await sendMessage(this.env, message.channel_id, FALLBACK_REPLY, message.id).catch((fallbackError) =>
-						console.error(`Gateway: fallback reply also failed: ${errorMessage(fallbackError)}`, fallbackError),
+						console.error(
+							{ message: "Gateway fallback reply also failed", error: errorMessage(fallbackError) },
+							fallbackError,
+						),
 					);
 				} finally {
 					stopTyping();
@@ -395,7 +401,7 @@ export class DiscordGateway extends DurableObject<Env> {
 	private startTyping(channelId: string): () => void {
 		const fire = () =>
 			triggerTyping(this.env, channelId).catch((error) =>
-				console.warn(`Gateway: typing indicator failed: ${errorMessage(error)}`),
+				console.warn({ message: "Gateway typing indicator failed", error: errorMessage(error) }),
 			);
 		fire();
 		const intervalId = setInterval(fire, TYPING_REFRESH_MS);

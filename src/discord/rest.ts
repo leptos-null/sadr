@@ -29,21 +29,22 @@ function authHeaders(env: Env, hasBody: boolean): HeadersInit {
 }
 
 /**
- * Renders the rate-limit headers Discord attaches to most responses. `scope`/`global` are only
- * ever sent on a 429 (<https://docs.discord.com/developers/topics/rate-limits>), so only rendered there.
+ * Extracts the rate-limit headers Discord attaches to most responses. `scope`/`global` are only
+ * ever sent on a 429 (<https://docs.discord.com/developers/topics/rate-limits>), so only included there.
  */
-function rateLimitHeadersSummary(response: Response): string {
+function rateLimitHeaders(response: Response): Record<string, string | null> {
 	const headers = response.headers;
-	const parts = [
-		`limit=${headers.get("x-ratelimit-limit") ?? "?"}`,
-		`remaining=${headers.get("x-ratelimit-remaining") ?? "?"}`,
-		`resetAfter=${headers.get("x-ratelimit-reset-after") ?? "?"}s`,
-		`bucket=${headers.get("x-ratelimit-bucket") ?? "none"}`,
-	];
+	const summary: Record<string, string | null> = {
+		limit: headers.get("x-ratelimit-limit"),
+		remaining: headers.get("x-ratelimit-remaining"),
+		resetAfterSeconds: headers.get("x-ratelimit-reset-after"),
+		bucket: headers.get("x-ratelimit-bucket"),
+	};
 	if (response.status === 429) {
-		parts.push(`scope=${headers.get("x-ratelimit-scope") ?? "?"}`, `global=${headers.get("x-ratelimit-global") ?? "false"}`);
+		summary.scope = headers.get("x-ratelimit-scope");
+		summary.global = headers.get("x-ratelimit-global");
 	}
-	return parts.join(" ");
+	return summary;
 }
 
 /** One request attempt, warning if it took pathologically long. */
@@ -60,9 +61,9 @@ async function sendOnce(env: Env, method: string, path: string, body?: unknown):
 	});
 	const durationMs = Date.now() - start;
 	if (durationMs > SLOW_CALL_THRESHOLD_MS) {
-		console.warn(`Discord REST: ${method} ${path} took ${durationMs}ms`);
+		console.warn({ message: "Discord REST slow call", method, path, durationMs });
 	}
-	debugLog(env, () => `Discord REST: ${method} ${path} rate limit ${rateLimitHeadersSummary(response)}`);
+	debugLog(env, () => ({ message: "Discord REST rate limit", method, path, rateLimit: rateLimitHeaders(response) }));
 	return response;
 }
 
@@ -101,7 +102,7 @@ async function discordFetch(
 	body?: unknown,
 	options?: { allowMissing?: boolean },
 ): Promise<Response | null> {
-	debugLog(env, () => `Discord REST: ${method} ${path}${body === undefined ? "" : ` ${JSON.stringify(body)}`}`);
+	debugLog(env, () => ({ message: "Discord REST request", method, path, body }));
 	// Unbounded on purpose: the retry budget is spent via `attempt` below, and bounding the loop
 	// itself would add a tail the compiler demands but nothing can reach.
 	for (let attempt = 0; ; attempt++) {
@@ -115,7 +116,7 @@ async function discordFetch(
 			return response;
 		}
 		// Not debug-gated: like the slow-call warning, being rate limited is worth seeing in production.
-		console.warn(`Discord REST: ${method} ${path} rate limited, retrying in ${retryMs}ms`);
+		console.warn({ message: "Discord REST rate limited, retrying", method, path, retryMs });
 		await delay(retryMs);
 	}
 }
@@ -124,7 +125,7 @@ async function discordFetch(
 async function discordJson<T>(env: Env, method: string, path: string, body?: unknown): Promise<T> {
 	const response = await discordFetch(env, method, path, body);
 	const data = (await response.json()) as T;
-	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
 	return data;
 }
 
@@ -168,8 +169,10 @@ export async function sendMessage(
 		// deleted or the id is otherwise invalid, rather than erroring the whole request.
 		body.message_reference = { message_id: replyToMessageId, fail_if_not_exists: false };
 	}
-	const response = await discordFetch(env, "POST", `/channels/${channelId}/messages`, body);
-	debugLog(env, () => `Discord REST: response ${response.status}`);
+	const method = "POST";
+	const path = `/channels/${channelId}/messages`;
+	const response = await discordFetch(env, method, path, body);
+	debugLog(env, () => ({ message: "Discord REST response", method, path, status: response.status }));
 }
 
 /** Triggers Discord's typing indicator in a channel; it shows for ~10s or until a message is sent. */
@@ -199,12 +202,12 @@ export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {
  * `userId` isn't a member of `guildId` (a 404 here just means that, not a failure).
  */
 export async function getGuildMember(env: Env, guildId: string, userId: string): Promise<DiscordGuildMember | null> {
-	const response = await discordFetch(env, "GET", `/guilds/${guildId}/members/${userId}`, undefined, {
-		allowMissing: true,
-	});
+	const method = "GET";
+	const path = `/guilds/${guildId}/members/${userId}`;
+	const response = await discordFetch(env, method, path, undefined, { allowMissing: true });
 	if (!response) return null;
 	const data = (await response.json()) as DiscordGuildMember;
-	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
 	return data;
 }
 
@@ -220,12 +223,12 @@ export async function getGuildMember(env: Env, guildId: string, userId: string):
  * this single-user route carries no `GUILD_MEMBERS` privileged-intent requirement.
  */
 export async function getThreadMember(env: Env, threadId: string, userId: string): Promise<DiscordThreadMember | null> {
-	const response = await discordFetch(env, "GET", `/channels/${threadId}/thread-members/${userId}`, undefined, {
-		allowMissing: true,
-	});
+	const method = "GET";
+	const path = `/channels/${threadId}/thread-members/${userId}`;
+	const response = await discordFetch(env, method, path, undefined, { allowMissing: true });
 	if (!response) return null;
 	const data = (await response.json()) as DiscordThreadMember;
-	debugLog(env, () => `Discord REST: response ${JSON.stringify(data)}`);
+	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
 	return data;
 }
 

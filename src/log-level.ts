@@ -20,11 +20,14 @@ export function isDebugEnabled(env: { LOG_LEVEL: string }): boolean {
 
 /**
  * Verbose, local-only tracing — gated behind LOG_LEVEL="debug" (set via .dev.vars, never in
- * production). Takes a factory rather than a string so the message is only built when needed.
+ * production). Takes a factory rather than a value so it's only built when needed. The factory
+ * should return a structured object (e.g. `{ message: "...", ...fields }`), not a pre-formatted
+ * string, so Workers Logs can index the individual fields — see the Workers Logs best-practices
+ * doc on structured JSON logging.
  */
-export function debugLog(env: { LOG_LEVEL: string }, messageFactory: () => string): void {
+export function debugLog(env: { LOG_LEVEL: string }, valueFactory: () => unknown): void {
 	if (isDebugEnabled(env)) {
-		console.log(messageFactory());
+		console.log(valueFactory());
 	}
 }
 

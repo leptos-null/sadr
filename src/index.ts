@@ -12,7 +12,7 @@ export default {
 		ctx.waitUntil(
 			gateway(env)
 				.ensureConnected()
-				.catch((error) => console.error(`ensureConnected failed: ${errorMessage(error)}`, error)),
+				.catch((error) => console.error({ message: "ensureConnected failed", error: errorMessage(error) }, error)),
 		);
 		return new Response("ok");
 	},

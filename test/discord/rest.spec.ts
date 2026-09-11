@@ -55,7 +55,7 @@ describe("slow Discord REST call warning", () => {
 
 		await getGatewayBotUrl(env);
 
-		expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("took 3001ms"));
+		expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({ method: "GET", path: "/gateway/bot", durationMs: 3001 }));
 	});
 
 	it("doesn't warn for a call under the threshold", async () => {

@@ -80,6 +80,8 @@ export interface ReplyResult {
 interface FunctionCall {
 	name: string;
 	args?: Record<string, unknown>;
+	/** Not used — this project's calls are stateless, so there's no functionResponse to correlate it with. */
+	id?: string;
 }
 
 interface ContentPart {
@@ -100,9 +102,16 @@ interface GenerateContentRequest {
 	toolConfig: { functionCallingConfig: { mode: "ANY" } };
 }
 
+interface UsageMetadata {
+	promptTokenCount?: number;
+	candidatesTokenCount?: number;
+	totalTokenCount?: number;
+}
+
 interface GenerateContentResponse {
 	candidates?: Array<{ content?: Content; finishReason?: string }>;
 	promptFeedback?: { blockReason?: string };
+	usageMetadata?: UsageMetadata;
 }
 
 const fetchHistoryDeclaration = {
@@ -233,7 +242,7 @@ async function callGemini(
 	botUsername: string,
 	guild: GuildInfo | null,
 	gatherTurnsLeft: number,
-): Promise<ContentPart[]> {
+): Promise<GenerateContentResponse> {
 	const functionDeclarations =
 		gatherTurnsLeft > 0 ? [fetchHistoryDeclaration, sendReplyDeclaration] : [sendReplyDeclaration];
 	const requestBody: GenerateContentRequest = {
@@ -242,7 +251,7 @@ async function callGemini(
 		tools: [{ functionDeclarations }],
 		toolConfig: { functionCallingConfig: { mode: "ANY" } },
 	};
-	debugLog(env, () => `Gemini: request ${JSON.stringify(requestBody)}`);
+	debugLog(env, () => ({ message: "Gemini request", requestBody }));
 	const response = await fetch(`${API_BASE}/${MODEL}:generateContent`, {
 		method: "POST",
 		headers: {
@@ -256,18 +265,8 @@ async function callGemini(
 		throw new Error(`Gemini generateContent failed: ${response.status} ${await response.text()}`);
 	}
 	const data = (await response.json()) as GenerateContentResponse;
-	debugLog(env, () => `Gemini: response ${JSON.stringify(data)}`);
-	const candidate = data.candidates?.[0];
-	// A candidate can come back with no parts at all (finishReason MAX_TOKENS/SAFETY/RECITATION, or a
-	// blocked prompt) — name the reason here, or this throws an undiagnosable TypeError instead.
-	if (!candidate?.content?.parts?.length) {
-		throw new Error(
-			`Gemini generateContent returned no content parts ` +
-			`(finishReason: ${candidate?.finishReason ?? "none"}, blockReason: ${data.promptFeedback?.blockReason ?? "none"}): ` +
-			JSON.stringify(data),
-		);
-	}
-	return candidate.content.parts;
+	debugLog(env, () => ({ message: "Gemini response", data }));
+	return data;
 }
 
 /** A `HistoryMessage` as it actually goes on the wire: `channelId`/`author`/`mentionedUsers` live elsewhere in the payload. */
@@ -444,7 +443,7 @@ export async function generateReply(
 			try {
 				return { id, info: await fetchChannel(id), failed: false };
 			} catch (error) {
-				console.error(`Gemini: failed to fetch channel ${id}: ${errorMessage(error)}`, error);
+				console.error({ message: "Gemini failed to fetch channel", channelId: id, error: errorMessage(error) }, error);
 				return { id, info: null, failed: true };
 			}
 		}),
@@ -471,7 +470,15 @@ export async function generateReply(
 					failed: false,
 				};
 			} catch (error) {
-				console.error(`Gemini: failed to fetch linked message ${link.messageId} in channel ${link.channelId}: ${errorMessage(error)}`, error);
+				console.error(
+					{
+						message: "Gemini failed to fetch linked message",
+						channelId: link.channelId,
+						messageId: link.messageId,
+						error: errorMessage(error),
+					},
+					error,
+				);
 				return { channelId: link.channelId, messages: [] as HistoryMessage[], failed: true };
 			}
 		}),
@@ -509,7 +516,7 @@ export async function generateReply(
 	for (let call = 0; call < MAX_GEMINI_CALLS; call++) {
 		// Hits 0 on the final call, which is what withholds the fetch tool and forces a conclusion.
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
-		const parts = await callGemini(
+		const geminiResponse = await callGemini(
 			env,
 			buildContents(trigger, resolved, guild, channelInfoById, inaccessibleChannelIds),
 			botUserId,
@@ -517,6 +524,35 @@ export async function generateReply(
 			guild,
 			gatherTurnsLeft,
 		);
+
+		console.log({
+			message: "Gemini call completed",
+			call,
+			promptTokenCount: geminiResponse.usageMetadata?.promptTokenCount,
+			candidatesTokenCount: geminiResponse.usageMetadata?.candidatesTokenCount,
+			totalTokenCount: geminiResponse.usageMetadata?.totalTokenCount,
+		});
+
+		const responseCandidates = geminiResponse.candidates ?? [];
+		const candidateCount = responseCandidates.length;
+
+		if (candidateCount === 0) {
+			throw new Error(`Gemini generateContent returned no candidates: ${JSON.stringify(geminiResponse)}`);
+		}
+		if (candidateCount !== 1) {
+			console.warn({ message: "Gemini generateContent returned unexpected candidate count, using the first", candidateCount });
+		}
+
+		const responseCandidate = responseCandidates[0];
+		const parts = responseCandidate.content?.parts;
+		if (!parts?.length) {
+			// A candidate can come back with no parts at all
+			// (finishReason MAX_TOKENS/SAFETY/RECITATION, or a blocked prompt) —
+			// name the reason here, or this throws an undiagnosable TypeError instead.
+			throw new Error(
+				`Gemini generateContent returned no content parts (finishReason: ${responseCandidate.finishReason ?? "none"}, blockReason: ${geminiResponse.promptFeedback?.blockReason ?? "none"})`,
+			);
+		}
 
 		// Gemini can return several function calls in one candidate, so take every one rather than
 		// the first — dropping the rest would leave the model believing it had asked for context it
@@ -534,7 +570,7 @@ export async function generateReply(
 
 		for (const functionCall of functionCalls) {
 			if (functionCall.name !== FETCH_HISTORY_FUNCTION) {
-				console.error(`Gemini called an unknown function: ${JSON.stringify(functionCall)}`);
+				console.error({ message: "Gemini called an unknown function", functionCall });
 				continue;
 			}
 
@@ -556,7 +592,7 @@ export async function generateReply(
 			// still terminates.
 			const key = fetchKey(channelId, messageId);
 			if (fetchedAnchors.has(key)) {
-				console.warn(`Gemini re-requested an already-fetched anchor: ${key}`);
+				console.warn({ message: "Gemini re-requested an already-fetched anchor", channelId, messageId });
 				continue;
 			}
 			fetchedAnchors.add(key);
