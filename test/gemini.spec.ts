@@ -814,6 +814,27 @@ describe("generateReply", () => {
 		});
 	});
 
+	it("orders same-millisecond messages by snowflake id, not by the order Discord returned them", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const sameInstant = "2024-01-02T00:00:00.000Z";
+		const earlier: HistoryMessage = { ...TRIGGER, id: "1001", content: "first", date: sameInstant };
+		const later: HistoryMessage = { ...TRIGGER, id: "1002", content: "second", date: sameInstant };
+		// Newest first, as Discord's Get Channel Messages returns them.
+		const fetchAround = vi.fn().mockResolvedValue([later, earlier]);
+
+		await generateReply(env, BOT, TRIGGER, { fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel });
+
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[HOME_CHANNEL_ID].messages.map((message: { id: string }) => message.id)).toEqual([
+			TRIGGER.id,
+			earlier.id,
+			later.id,
+		]);
+	});
+
 	it("follows a reply chain by fetching around a specific message id", async () => {
 		vi.spyOn(globalThis, "fetch")
 			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "77" }))

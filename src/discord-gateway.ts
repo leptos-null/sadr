@@ -120,6 +120,8 @@ export class DiscordGateway extends DurableObject<Env> {
 	private async handleMessage(event: MessageEvent): Promise<void> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
 		debugLog(this.env, () => ({ message: "Gateway received payload", payload }));
+		// Persisted on every frame, not batched: a RESUME replays every dispatch after the stored
+		// sequence, and a replayed MESSAGE_CREATE after an eviction would be replied to twice.
 		if (payload.s != null) {
 			this.sequence = payload.s;
 			await this.ctx.storage.put("sequence", payload.s);

@@ -288,9 +288,11 @@ function buildContents(
 	inaccessibleChannelIds: Set<string>,
 ): Content[] {
 	// Parsed rather than compared as strings, so ordering doesn't depend on Discord rendering every
-	// timestamp at identical precision.
-	const sorted = [...resolved.values()]
-		.sort((a, b) => Date.parse(a.date) - Date.parse(b.date));
+	// timestamp at identical precision. Same-millisecond messages fall back to their snowflake ids,
+	// which Discord assigns in order — compared by length then text, since a longer decimal is larger.
+	const sorted = [...resolved.values()].sort(
+		(a, b) => Date.parse(a.date) - Date.parse(b.date) || a.id.length - b.id.length || (a.id < b.id ? -1 : 1),
+	);
 
 	/** An accessible channel's "channels" entry. An inaccessible one is exactly `{inaccessible: true}` instead — never a mix. */
 	type AccessibleChannelEntry = { name: string | null; topic: string | null; messages: unknown[] };
