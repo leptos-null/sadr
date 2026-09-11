@@ -197,9 +197,8 @@ export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {
 }
 
 /**
- * Fetches a guild member — specifically their roles, used to check a Discord message-link's target
- * channel against the requesting user's own role overwrites, not just `@everyone`'s. Null if
- * `userId` isn't a member of `guildId` (a 404 here just means that, not a failure).
+ * Fetches a guild member — for their roles, which the message-link permission check resolves channel
+ * overwrites against. Null if `userId` isn't a member of `guildId`.
  */
 export async function getGuildMember(env: Env, guildId: string, userId: string): Promise<DiscordGuildMember | null> {
 	const method = "GET";
@@ -214,13 +213,12 @@ export async function getGuildMember(env: Env, guildId: string, userId: string):
 /**
  * Fetches a thread member — used only to check whether `userId` was actually added to a private
  * thread, whose audience is that explicit list rather than anything in its parent channel's
- * overwrites. Null if they aren't a member (a 404 here just means that, not a failure).
+ * overwrites. Null if they aren't a member.
  *
- * Membership on its own doesn't prove they can still see the thread: losing access to the parent
- * channel doesn't remove anyone from a thread, and they keep being reported as a member afterwards
- * (<https://docs.discord.com/developers/topics/threads#losing-access-to-channels>), so
- * `canReadChannel` has to pass against the parent channel as well. Unlike `List Thread Members`,
- * this single-user route carries no `GUILD_MEMBERS` privileged-intent requirement.
+ * Membership alone doesn't prove they can still see the thread: losing access to the parent channel
+ * doesn't remove anyone from it (<https://docs.discord.com/developers/topics/threads#losing-access-to-channels>),
+ * so `canReadChannel` has to pass against the parent as well. Unlike `List Thread Members`, this
+ * single-user route needs no `GUILD_MEMBERS` privileged intent.
  */
 export async function getThreadMember(env: Env, threadId: string, userId: string): Promise<DiscordThreadMember | null> {
 	const method = "GET";

@@ -1,17 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import {
-	getChannel,
-	getChannelMessages,
-	getCurrentUser,
-	getGatewayBotUrl,
-	getGuild,
-	getGuildMember,
-	getThreadMember,
-	sendMessage,
-	triggerTyping,
-} from "./discord/rest";
+import { getCurrentUser, getGatewayBotUrl } from "./discord/rest";
 import { isAddressedToBot } from "./discord/mentions";
-import { canReadChannel, isAtLeastAsReadableAs } from "./discord/permissions";
 import {
 	GatewayOpcode,
 	type GatewayPayload,
@@ -21,18 +10,9 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
-import {
-	ChannelType,
-	isThread,
-	type DiscordChannel,
-	type DiscordGuild,
-	type DiscordGuildMember,
-	type DiscordMessage,
-	type DiscordUser,
-} from "./discord/types";
-import { generateReply, type ChannelInfo, type GuildInfo, type HistoryMessage, type UserInfo } from "./gemini";
 import { delay } from "./delay";
 import { debugLog, errorMessage } from "./log-level";
+import { replyToMessage } from "./reply";
 
 // GUILDS (1 << 0) + GUILD_MESSAGES (1 << 9) + DIRECT_MESSAGES (1 << 12) + MESSAGE_CONTENT (1 << 15).
 // MESSAGE_CONTENT is privileged: without it, content/embeds/attachments come back empty for any
@@ -48,46 +28,6 @@ const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 // a self-rescheduling alarm (comfortably under 70s, with margin) keeps the DO — and therefore the
 // connection — alive indefinitely.
 const KEEPALIVE_INTERVAL_MS = 60_000;
-
-// Discord's typing indicator only lasts ~10s; refreshed comfortably before it expires so it stays
-// up for the whole time a reply is being generated (generateReply can take multiple Gemini calls).
-const TYPING_REFRESH_MS = 8_000;
-
-/** Sent to the user when generating or delivering a real reply failed — silence is worse. */
-const FALLBACK_REPLY = "Sorry — something went wrong while I was working on a reply. Mind trying again?";
-
-/** As `toHistoryMessage`, for a single Discord user's name info. */
-function toUserInfo(user: DiscordUser): UserInfo {
-	return { username: user.username, globalName: user.global_name ?? null };
-}
-
-/** Maps either transport's message shape — both extend `DiscordMessage` — to what Gemini is given. */
-function toHistoryMessage(message: DiscordMessage): HistoryMessage {
-	return {
-		id: message.id,
-		channelId: message.channel_id,
-		userId: message.author.id,
-		author: toUserInfo(message.author),
-		content: message.content,
-		date: message.timestamp,
-		replyToId: message.message_reference?.message_id ?? null,
-		editedDate: message.edited_timestamp ?? undefined,
-		attachments: message.attachments?.length ? message.attachments.map((attachment) => attachment.filename) : undefined,
-		mentionedUsers: message.mentions?.length
-			? message.mentions.map((mentioned) => ({ id: mentioned.id, ...toUserInfo(mentioned) }))
-			: undefined,
-	};
-}
-
-/** As `toHistoryMessage`, for the channel metadata Gemini is given. */
-function toChannelInfo(channel: DiscordChannel): ChannelInfo {
-	return { name: channel.name ?? null, topic: channel.topic ?? null };
-}
-
-/** As `toHistoryMessage`, for the guild metadata Gemini is given. */
-function toGuildInfo(guild: DiscordGuild): GuildInfo {
-	return { name: guild.name, description: guild.description };
-}
 
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
@@ -254,158 +194,10 @@ export class DiscordGateway extends DurableObject<Env> {
 				}
 				if (!isAddressedToBot(message, this.botUserId)) return;
 				debugLog(this.env, () => ({ message: "Gateway received message", content: message.content }));
-				const stopTyping = this.startTyping(message.channel_id);
-				// Scoped to this one reply, not the DO instance — every message-link permission check
-				// this reply resolves shares it, so linking multiple messages from the same guild only
-				// fetches that member once, but membership is never assumed stale across replies. Caches
-				// the in-flight promise, not the resolved value: canReadLinkedChannel's callers run
-				// concurrently (Promise.all over each candidate link), so caching only the settled value
-				// would let every one of them race past an empty cache before the first ever resolves.
-				const memberCache = new Map<string, Promise<DiscordGuildMember | null>>();
-				// Same reasoning, for the channel itself: canReadLinkedChannel's own permission check and
-				// generateReply's later channel-info fetch both need the same linked channel, and this is
-				// what lets the second one reuse the first's REST call instead of repeating it.
-				const channelCache = new Map<string, Promise<DiscordChannel>>();
-				const getChannelCached = (channelId: string): Promise<DiscordChannel> => {
-					let channelPromise = channelCache.get(channelId);
-					if (!channelPromise) {
-						channelPromise = getChannel(this.env, channelId);
-						channelCache.set(channelId, channelPromise);
-					}
-					return channelPromise;
-				};
-				// The channel whose overwrites actually govern `channel`, paired with that channel's own
-				// category. A thread carries no overwrites of its own and inherits its parent channel's
-				// outright — and a thread's parent_id is the text/forum channel it was created in, not a
-				// category, so the category is one further hop up. Resolving that first is what keeps a
-				// thread inside a category-synced private channel from reading as world-visible: both
-				// permission checks below would otherwise walk one level and find no overwrites at all.
-				// Null when a thread doesn't name a parent — nothing to check against, so nothing is relayed.
-				//
-				// Neither fetch swallows a failure, and the category one deliberately isn't optional. It
-				// only ever matters for a channel with no overwrites of its own, where `effectiveOverwrites`
-				// borrows the category's — a deliberate over-denial rather than Discord's own rule, which
-				// has no category term at all (see that function). Absorbing an error there would silently
-				// swap that over-denial for its opposite, "nothing is denied", and would do so past *both*
-				// permission checks below, since they'd share the same wrong input. Little is given up: a
-				// category is viewable whenever any of its children is, and the child was just fetched
-				// successfully. Throwing instead denies the link (see this callback's caller).
-				const governingChannels = async (
-					channel: DiscordChannel,
-				): Promise<{ governing: DiscordChannel; category: DiscordChannel | null } | null> => {
-					let governing = channel;
-					if (isThread(channel)) {
-						if (!channel.parent_id) return null;
-						governing = await getChannelCached(channel.parent_id);
-					}
-					const category = governing.parent_id ? await getChannelCached(governing.parent_id) : null;
-					return { governing, category };
-				};
-				try {
-					const reply = await generateReply(
-						this.env,
-						this.botUserId,
-						this.botUsername,
-						toHistoryMessage(message),
-						// guild_id's absence is Discord's own DM signal (the same check mentions.ts's
-						// isAddressedToBot relies on). A DM has no guild, so this round-trip is skipped
-						// entirely for a DM.
-						async () => (message.guild_id ? toGuildInfo(await getGuild(this.env, message.guild_id)) : null),
-						async (channelId) => {
-							// Only known to have no name/topic without a REST call for the home channel's own
-							// DM case (guild_id already told us); a linked channel always gets a real call —
-							// toChannelInfo naturally reports null name/topic if it also turns out to be a DM.
-							if (channelId === message.channel_id && !message.guild_id) return null;
-							return toChannelInfo(await getChannelCached(channelId));
-						},
-						async (channelId, messageId, limit) => {
-							const around = await getChannelMessages(this.env, channelId, { around: messageId, limit });
-							return around.map(toHistoryMessage);
-						},
-						async (channelId, userId) => {
-							const channel = await getChannelCached(channelId);
-							// A DM has no guild — no membership/overwrite model applies, so a link into one is
-							// never resolved (erring toward blocking rather than trusting an unverifiable claim).
-							if (!channel.guild_id) return false;
-							// A private thread is never as visible as an ordinary channel — its audience is an
-							// explicit member list, no superset of a channel's — so relaying one into a guild
-							// reply (posted for the whole home channel to read) is always denied. Decided before
-							// any of the round-trips below: without this, a guild-posted link to a private
-							// thread would still pay for a member lookup, a parent/category lookup, and a
-							// thread-member lookup on its way to this same "no".
-							if (message.guild_id && channel.type === ChannelType.PrivateThread) return false;
-							// Multiple links in one trigger can share a guild — the member's roles there don't
-							// change between them, so only the first lookup actually hits Discord.
-							const memberCacheKey = `${channel.guild_id}:${userId}`;
-							let memberPromise = memberCache.get(memberCacheKey);
-							if (!memberPromise) {
-								memberPromise = getGuildMember(this.env, channel.guild_id, userId);
-								memberCache.set(memberCacheKey, memberPromise);
-							}
-							const member = await memberPromise;
-							if (!member) return false;
-							const linked = await governingChannels(channel);
-							if (!linked) return false;
-							if (!canReadChannel(linked.governing, linked.category, userId, member.roles)) return false;
-							// A private thread's audience is whoever was explicitly added to it, which nothing in
-							// the parent channel's overwrites describes — so seeing the parent isn't enough. The
-							// two are required together, not in place of each other: losing access to the parent
-							// channel doesn't remove anyone from the thread, so membership can outlive visibility.
-							// Only reachable for a DM reply here — the guild case already returned above.
-							if (channel.type === ChannelType.PrivateThread) {
-								const threadMember = await getThreadMember(this.env, channel.id, userId);
-								if (!threadMember) return false;
-							}
-							// The asker being able to read the linked channel is only half of it in a guild: the
-							// reply is posted for everyone in the home channel to read, so the linked channel has
-							// to be no narrower than the one it's being relayed into. A DM needs no such check —
-							// its only audience is the asker, who canReadChannel already cleared, and it's the one
-							// path where that check decides anything on its own (the guild path deliberately
-							// runs both, though the check below subsumes the one above there — see its comment).
-							if (!message.guild_id) return true;
-							const home = await governingChannels(await getChannelCached(message.channel_id));
-							if (!home) return false;
-							// A home channel that's itself a thread gets compared as its parent channel, i.e. as
-							// a wider audience than it really has. That over-denies rather than over-shares.
-							return isAtLeastAsReadableAs(linked.governing, linked.category, home.governing, home.category);
-						},
-					);
-					console.log({ message: "Gateway generated reply, sending to channel", channelId: message.channel_id });
-					await sendMessage(this.env, message.channel_id, reply.content, reply.replyToMessageId ?? undefined);
-				} catch (error) {
-					// Whoever addressed the bot can't tell silence from "still thinking", so always say
-					// something back — but never let the fallback's own failure escape past this log.
-					console.error(
-						{ message: "Gateway failed to reply to message", messageId: message.id, error: errorMessage(error) },
-						error,
-					);
-					await sendMessage(this.env, message.channel_id, FALLBACK_REPLY, message.id).catch((fallbackError) =>
-						console.error(
-							{ message: "Gateway fallback reply also failed", error: errorMessage(fallbackError) },
-							fallbackError,
-						),
-					);
-				} finally {
-					stopTyping();
-				}
+				await replyToMessage(this.env, { id: this.botUserId, username: this.botUsername }, message);
 				break;
 			}
 		}
-	}
-
-	/**
-	 * Starts Discord's typing indicator and keeps refreshing it until the returned callback is
-	 * called. A single failed refresh is logged and skipped rather than aborting the loop — the next
-	 * tick tries again, and a reply is still coming either way.
-	 */
-	private startTyping(channelId: string): () => void {
-		const fire = () =>
-			triggerTyping(this.env, channelId).catch((error) =>
-				console.warn({ message: "Gateway typing indicator failed", error: errorMessage(error) }),
-			);
-		fire();
-		const intervalId = setInterval(fire, TYPING_REFRESH_MS);
-		return () => clearInterval(intervalId);
 	}
 
 	private async identifyOrResume(): Promise<void> {

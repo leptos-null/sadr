@@ -12,19 +12,14 @@ function hasBit(permissions: string, bit: bigint): boolean {
  * The overwrites this bot treats as governing `channel`: its own `permission_overwrites` when it has
  * any, and `parentChannel`'s only when it has none at all.
  *
- * That fallback is deliberately *not* Discord's own rule. Discord computes a channel's permissions
- * from that channel's overwrite list and nothing else — there is no category term in the calculation
- * (<https://docs.discord.com/developers/topics/permissions#permission-overwrites>). A channel that
- * looks like it inherits from its category is "synced": it carries its own copy of the category's
- * overwrites, so it never reaches this fallback at all
- * (<https://docs.discord.com/developers/topics/permissions#permission-syncing>). What does reach it
- * is a channel de-synced down to an empty list — one Discord itself applies no restrictions to. So
- * borrowing the category's overwrites there can only invent a restriction Discord wouldn't, never
- * drop one it would: the same direction everything else here errs in, over-denying rather than
- * over-sharing.
+ * That fallback is deliberately *not* Discord's rule: Discord has no category term at all
+ * (<https://docs.discord.com/developers/topics/permissions#permission-overwrites>), and a "synced"
+ * channel carries its own copy of its category's overwrites, so it never reaches the fallback
+ * (<https://docs.discord.com/developers/topics/permissions#permission-syncing>). Only a channel
+ * de-synced down to an empty list does — one Discord applies no restrictions to — so borrowing the
+ * category's overwrites can only over-deny, never over-share.
  *
- * Shared by both exported functions deliberately: they compare readability against each other, so a
- * disagreement about which overwrites apply would make one contradict the other.
+ * Shared by both exported functions so they can't disagree about which overwrites apply.
  */
 function effectiveOverwrites(
 	channel: DiscordChannel,
@@ -80,24 +75,18 @@ function isGranted(
 
 /**
  * Whether `userId` — a guild member holding `userRoleIds` — can read `channel`'s messages. Both
- * VIEW_CHANNEL and READ_MESSAGE_HISTORY, resolved independently, because they are independent bits
- * and reading needs each: without the latter, Get Channel Messages returns nothing at all
- * (<https://docs.discord.com/developers/resources/message#get-channel-messages>). Seeing a channel
- * without being able to read its backlog is an ordinary server setup, and that backlog is exactly
- * what relaying a link would hand over. Denying VIEW_CHANNEL implicitly denies the other
+ * VIEW_CHANNEL and READ_MESSAGE_HISTORY, resolved independently, because reading needs each: without
+ * the latter, Get Channel Messages returns nothing at all
+ * (<https://docs.discord.com/developers/resources/message#get-channel-messages>) — and that backlog
+ * is exactly what relaying a link would hand over. Denying VIEW_CHANNEL implicitly denies the other
  * (<https://docs.discord.com/developers/topics/permissions#implicit-permissions>), so the second
  * check only ever narrows the first.
  *
- * Which overwrites apply — `channel`'s own, or its category's — is `effectiveOverwrites` above.
+ * Never fetches the member's role *permissions*, so there's no guild-level Administrator bypass — an
+ * admin might be wrongly denied. That's the intended direction to be wrong in: this exists to keep the
+ * bot from relaying a channel a user can't read, not to reproduce Discord's rules exactly.
  *
- * Deliberately not full permission resolution: this never fetches the member's role *permissions*, so
- * it can't know about a guild-level Administrator bypass (which ignores channel overwrites entirely)
- * — an admin who should see everything might still be treated as denied here. That's the intended,
- * safer direction to be wrong in — this exists to keep the bot from relaying a channel a user can't
- * read, not to perfectly reproduce Discord's own rules.
- *
- * Only load-bearing on its own for a DM: `isAtLeastAsReadableAs` below is strictly stronger wherever
- * it applies, and a guild reply runs both. See that function for why the redundant one is kept.
+ * On the guild path `isAtLeastAsReadableAs` subsumes this — see there before removing either.
  */
 export function canReadChannel(
 	channel: DiscordChannel,
@@ -170,40 +159,25 @@ function isAtLeastAsGrantedAs(
 
 /**
  * Whether every guild member who can read `referenceChannel` can also read `channel` — i.e. relaying
- * `channel`'s content into `referenceChannel` exposes it to nobody who couldn't already read it.
+ * `channel`'s content into `referenceChannel` exposes it to nobody who couldn't already read it. This
+ * is the audience-wide half of the link check: a guild reply is posted for the whole channel, not
+ * just whoever asked, so the asker being able to read `channel` (`canReadChannel`) isn't enough.
  *
- * `canReadChannel` above answers a different question: whether *one* person can read a channel. That
- * isn't enough on its own for a guild reply, because the reply is posted for the whole channel to
- * read, not just whoever asked — someone with access to a private channel could otherwise get the
- * bot to repeat its contents somewhere everyone can see. This is that second, audience-wide half.
+ * Needs no Discord round-trips: a role named in neither channel's `effectiveOverwrites` resolves to
+ * the `@everyone` outcome on both, so only the ids one of them names can tell them apart. Each of the
+ * two bits is compared on its own — a role could be granted one on both channels and the other only
+ * on the reference.
  *
- * Answered without any extra Discord round-trips, by comparing the two channels' `effectiveOverwrites`
- * directly: a role named in neither channel's overwrites resolves to the `@everyone` outcome on both,
- * so only the ids one of them actually names can distinguish the two, and the guild's full role list
- * is never needed. Each of the two bits `canReadChannel` requires is compared on its own, which is
- * stronger than comparing the pair together — a role could be granted one on both channels and the
- * other on only the reference.
+ * Conservative rather than exact: Discord combines a member's roles into one tier (see `isGranted`),
+ * so an id-by-id comparison can reject a pair no real combination of roles could tell apart, but it
+ * can never accept one that a combination could.
  *
- * Deliberately conservative rather than exact. Discord resolves a member's roles as a combined tier
- * (see `isGranted`), so an id-by-id comparison can reject a pair that no *actual* combination of
- * roles could tell apart — but it can never accept one that a combination could, which is the half
- * that matters. Same direction to be wrong in as `canReadChannel`'s missing Administrator bypass.
- *
- * Strong enough that it makes `canReadChannel` — and the `getGuildMember` roles lookup feeding it —
- * redundant on the guild path, which is worth knowing before anyone tries to simplify one away.
- * Passing every comparison means the reference channel allows nobody this one doesn't, denies nobody
- * this one doesn't already deny, and is no more open to `@everyone`; the asker, meanwhile, has proven
- * they can read the reference channel by posting the message that triggered this. So whichever tier
- * let them read the reference channel carries over to this one, and checking them individually can
- * only reach the same answer. That argument covers exactly the comparisons `isAtLeastAsGrantedAs`
- * makes and no others — a channel whose audience isn't described by overwrites at all (a private
- * thread, whose members are an explicit list) would break it, so it has to be re-made, not assumed,
- * if one is added.
- *
- * Both checks are kept anyway. The redundant one costs a single already-cached round-trip, and it's
- * the only thing standing behind that argument if it's ever quietly outgrown — and, unlike this
- * function, it still applies when the reply is going to a DM, where there's no audience to compare
- * against and no `guild_id` here to compare with.
+ * On the guild path this makes `canReadChannel` (and the roles lookup feeding it) redundant: the
+ * reference channel allows nobody this one doesn't, denies nobody this one doesn't, and is no more
+ * open to `@everyone` — and the asker proved they can read the reference channel by posting in it.
+ * That argument only holds for audiences described by overwrites; a private thread's explicit member
+ * list breaks it. Both checks are kept anyway: the redundant one costs one cached round-trip, backs up
+ * this argument if it's ever outgrown, and is the only one that applies to a DM reply.
  */
 export function isAtLeastAsReadableAs(
 	channel: DiscordChannel,

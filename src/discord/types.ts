@@ -39,9 +39,8 @@ export const ChannelType = {
 } as const;
 
 /**
- * Whether `channel` is a thread — meaning its `permission_overwrites` are empty and its `parent_id`
- * points at the text/forum channel it was created in (not a category), whose permissions it inherits.
- * <https://docs.discord.com/developers/topics/threads#thread-fields>
+ * Whether `channel` is a thread — one with no `permission_overwrites` of its own, inheriting its
+ * parent channel's (see `parent_id`). <https://docs.discord.com/developers/topics/threads#thread-fields>
  */
 export function isThread(channel: DiscordChannel): boolean {
 	return (
@@ -62,7 +61,7 @@ export interface DiscordChannel {
 	topic?: string | null;
 	/** The guild this channel belongs to. Absent for a DM channel — the one signal that it is one. */
 	guild_id?: string;
-	/** For an ordinary channel, the category it belongs to, if any. For a thread this is instead the text/forum channel it was created in, so its category is one further hop up. What, if anything, a channel takes from its `parent_id` when resolving permissions is `effectiveOverwrites`' call, not Discord's — see that function. */
+	/** For an ordinary channel, the category it belongs to, if any. For a thread, the text/forum channel it was created in — so its category is one further hop up. */
 	parent_id?: string | null;
 	permission_overwrites?: DiscordPermissionOverwrite[];
 }

@@ -4,12 +4,11 @@ export interface MessageLink {
 	messageId: string;
 }
 
-// The leading guild segment is either a guild id or "@me" (a DM link) — irrelevant here since
-// GET /channels/{channel}/messages/{message} doesn't need it. It's also not validated by Discord
-// itself against the channel it precedes (checked live on iOS, Discord build 343.0 (110587)): a link
-// with a mismatched or arbitrary guild segment still opens the real channel. So even where a guild id
-// is wanted later (e.g. a permissions check), it must come from the fetched channel's own reported
-// guild_id — never from this segment.
+// The leading guild segment is either a guild id or "@me" (a DM link), and isn't captured: every
+// Discord call made for a link is keyed by channel id alone. Nor could it be trusted — Discord doesn't
+// validate it against the channel it precedes (checked live on iOS, Discord build 343.0 (110587)): a
+// link with a mismatched or arbitrary guild segment still opens the real channel. So wherever a guild
+// id is needed (e.g. a permissions check), it must come from the fetched channel's own `guild_id`.
 const MESSAGE_LINK_PATTERN =
 	/https:\/\/(?:ptb\.|canary\.)?discord(?:app)?\.com\/channels\/(?:\d+|@me)\/(\d+)\/(\d+)/g;
 
