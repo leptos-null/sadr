@@ -37,6 +37,9 @@ const RESUMABLE_CLOSE_CODE = 4000;
 const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
 const FATAL_CLOSE_PAUSE_MS = 60 * 60_000;
 
+// Invalid seq, session timed out: Discord says start a new session, so a RESUME would only be rejected.
+const NON_RESUMABLE_CLOSE_CODES = new Set([4007, 4009]);
+
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
 	private isConnecting = false;
@@ -133,6 +136,11 @@ export class DiscordGateway extends DurableObject<Env> {
 			if (this.ws !== ws) return;
 			console.warn({ message: "Gateway closed", code: event.code, reason: event.reason });
 			this.handleClose();
+			if (NON_RESUMABLE_CLOSE_CODES.has(event.code)) {
+				this.clearSession().catch((error) =>
+					console.error({ message: "Gateway failed to clear the session", error: errorMessage(error) }, error),
+				);
+			}
 			if (FATAL_CLOSE_CODES.has(event.code)) {
 				const until = Date.now() + FATAL_CLOSE_PAUSE_MS;
 				console.error({ message: "Gateway closed with a fatal code, pausing reconnects", code: event.code, until: new Date(until).toISOString() });
@@ -188,10 +196,7 @@ export class DiscordGateway extends DurableObject<Env> {
 					break;
 				}
 				console.error({ message: "Gateway invalid session, not resumable (likely a bad token or invalid intents)" });
-				this.sessionId = undefined;
-				this.resumeGatewayUrl = undefined;
-				this.sequence = null;
-				await this.ctx.storage.delete(["sessionId", "resumeGatewayUrl", "sequence"]);
+				await this.clearSession();
 				// Discord recommends a short random delay before re-identifying after an invalid session.
 				await delay(1000 + Math.random() * 4000);
 				await this.identifyOrResume();
@@ -204,6 +209,13 @@ export class DiscordGateway extends DurableObject<Env> {
 				this.heartbeatAcked = true;
 				break;
 		}
+	}
+
+	private async clearSession(): Promise<void> {
+		this.sessionId = undefined;
+		this.resumeGatewayUrl = undefined;
+		this.sequence = null;
+		await this.ctx.storage.delete(["sessionId", "resumeGatewayUrl", "sequence"]);
 	}
 
 	private async handleDispatch(payload: GatewayPayload): Promise<void> {
@@ -223,6 +235,9 @@ export class DiscordGateway extends DurableObject<Env> {
 				});
 				break;
 			}
+			case "RESUMED":
+				console.log({ message: "Gateway RESUMED" });
+				break;
 			case "MESSAGE_CREATE": {
 				const message = payload.d as MessageCreateDispatchData;
 				if (message.author.bot) return;
