@@ -32,6 +32,11 @@ const KEEPALIVE_INTERVAL_MS = 60_000;
 // Closing with 1000/1001 invalidates the session; any other code leaves it resumable.
 const RESUMABLE_CLOSE_CODE = 4000;
 
+// Bad token, sharding, API version, or intents: Discord says stop reconnecting. Retrying every
+// minute would exhaust the 1000/day IDENTIFY limit, at which point Discord resets the bot token.
+const FATAL_CLOSE_CODES = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+const FATAL_CLOSE_PAUSE_MS = 60 * 60_000;
+
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
 	private heartbeatIntervalId?: ReturnType<typeof setInterval>;
@@ -79,6 +84,11 @@ export class DiscordGateway extends DurableObject<Env> {
 		// `this.ws !== ws` guards below then drop its events without closing it.
 		const state = this.ws?.readyState;
 		if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+		const pausedUntil = await this.ctx.storage.get<number>("reconnectPausedUntil");
+		if (pausedUntil !== undefined && Date.now() < pausedUntil) {
+			console.warn({ message: "Gateway reconnect paused after a fatal close code", until: new Date(pausedUntil).toISOString() });
+			return;
+		}
 		await this.connectToGateway();
 	}
 
@@ -112,6 +122,13 @@ export class DiscordGateway extends DurableObject<Env> {
 			if (this.ws !== ws) return;
 			console.warn({ message: "Gateway closed", code: event.code, reason: event.reason });
 			this.handleClose();
+			if (FATAL_CLOSE_CODES.has(event.code)) {
+				const until = Date.now() + FATAL_CLOSE_PAUSE_MS;
+				console.error({ message: "Gateway closed with a fatal code, pausing reconnects", code: event.code, until: new Date(until).toISOString() });
+				this.ctx.storage
+					.put("reconnectPausedUntil", until)
+					.catch((error) => console.error({ message: "Gateway failed to persist reconnect pause", error: errorMessage(error) }, error));
+			}
 		});
 		ws.addEventListener("error", (event) => {
 			if (this.ws !== ws) return;
