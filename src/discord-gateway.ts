@@ -29,6 +29,12 @@ const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 // connection — alive indefinitely.
 const KEEPALIVE_INTERVAL_MS = 60_000;
 
+// After an unexpected close, that alarm is pulled forward to this capped exponential backoff rather
+// than waiting out its full interval — recovery in seconds, while a socket that fails on every
+// attempt slows down instead of hot-looping through the daily IDENTIFY budget.
+const RECONNECT_BASE_DELAY_MS = 1_000;
+const RECONNECT_MAX_DELAY_MS = 30_000;
+
 // Closing with 1000/1001 invalidates the session; any other code leaves it resumable.
 const RESUMABLE_CLOSE_CODE = 4000;
 
@@ -40,24 +46,36 @@ const FATAL_CLOSE_PAUSE_MS = 60 * 60_000;
 // Invalid seq, session timed out: Discord says start a new session, so a RESUME would only be rejected.
 const NON_RESUMABLE_CLOSE_CODES = new Set([4007, 4009]);
 
+/** A resumable Gateway session — the three facts needed to RESUME rather than fresh-IDENTIFY, always set (and cleared) together. */
+interface Session {
+	id: string;
+	resumeUrl: string;
+	sequence: number;
+}
+
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
 	private isConnecting = false;
 	/** The initial jitter timeout, then the interval; clearTimeout clears either. */
 	private heartbeatTimerId?: ReturnType<typeof setTimeout>;
 	private heartbeatAcked = true;
-	private sessionId?: string;
-	private resumeGatewayUrl?: string;
-	private sequence: number | null = null;
+	private session: Session | null = null;
 	private botUserId?: string;
 	private botUsername?: string;
+	/** Unexpected closes since the connection was last healthy (READY/RESUMED reset it); drives the reconnect backoff. */
+	private reconnectAttempts = 0;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		ctx.blockConcurrencyWhile(async () => {
-			this.sessionId = await ctx.storage.get<string>("sessionId");
-			this.resumeGatewayUrl = await ctx.storage.get<string>("resumeGatewayUrl");
-			this.sequence = (await ctx.storage.get<number>("sequence")) ?? null;
+			const sessionId = await ctx.storage.get<string>("sessionId");
+			const resumeGatewayUrl = await ctx.storage.get<string>("resumeGatewayUrl");
+			const sequence = await ctx.storage.get<number>("sequence");
+			// The three are always written and cleared together, so a partial read means no session — a
+			// fresh IDENTIFY, the safe direction to be wrong in.
+			if (sessionId != null && resumeGatewayUrl != null && sequence != null) {
+				this.session = { id: sessionId, resumeUrl: resumeGatewayUrl, sequence };
+			}
 			this.botUserId = await ctx.storage.get<string>("botUserId");
 			this.botUsername = await ctx.storage.get<string>("botUsername");
 		});
@@ -106,7 +124,6 @@ export class DiscordGateway extends DurableObject<Env> {
 		previous?.close(RESUMABLE_CLOSE_CODE);
 
 		// Nothing after the try yields, so the flag only needs to cover the awaits inside it.
-		const resuming = Boolean(this.resumeGatewayUrl && this.sessionId);
 		let url: string;
 		this.isConnecting = true;
 		try {
@@ -118,8 +135,8 @@ export class DiscordGateway extends DurableObject<Env> {
 				this.botUsername = me.username;
 				await this.ctx.storage.put({ botUserId: me.id, botUsername: me.username });
 			}
-			if (resuming) {
-				url = this.resumeGatewayUrl!;
+			if (this.session) {
+				url = this.session.resumeUrl;
 			} else {
 				const gateway = await getGatewayBot(this.env);
 				// One IDENTIFY past the daily limit resets the bot token, so stop short of it.
@@ -134,7 +151,7 @@ export class DiscordGateway extends DurableObject<Env> {
 		} finally {
 			this.isConnecting = false;
 		}
-		console.log({ message: "Gateway connecting", mode: resuming ? "resume" : "fresh", url });
+		console.log({ message: "Gateway connecting", mode: this.session ? "resume" : "fresh", url });
 		const ws = new WebSocket(`${url}?v=10&encoding=json`);
 		// Guard every handler against events from a socket this DO has since moved on from
 		// (e.g. the old socket's belated "close" after a Reconnect already opened a new one).
@@ -159,14 +176,27 @@ export class DiscordGateway extends DurableObject<Env> {
 				this.ctx.storage
 					.put("reconnectPausedUntil", until)
 					.catch((error) => console.error({ message: "Gateway failed to persist reconnect pause", error: errorMessage(error) }, error));
+				return;
 			}
+			this.scheduleReconnect();
 		});
 		ws.addEventListener("error", (event) => {
 			if (this.ws !== ws) return;
 			console.error({ message: "Gateway socket error" }, event);
 			this.handleClose();
+			this.scheduleReconnect();
 		});
 		this.ws = ws;
+	}
+
+	/** Pulls the keep-alive alarm forward; alarm() then reconnects and reschedules itself as usual. */
+	private scheduleReconnect(): void {
+		const delayMs = Math.min(RECONNECT_MAX_DELAY_MS, RECONNECT_BASE_DELAY_MS * 2 ** this.reconnectAttempts);
+		this.reconnectAttempts++;
+		console.warn({ message: "Gateway scheduling reconnect", delayMs, attempt: this.reconnectAttempts });
+		this.ctx.storage
+			.setAlarm(Date.now() + delayMs)
+			.catch((error) => console.error({ message: "Gateway failed to schedule reconnect", error: errorMessage(error) }, error));
 	}
 
 	private handleClose(): void {
@@ -181,9 +211,11 @@ export class DiscordGateway extends DurableObject<Env> {
 		const payload = JSON.parse(event.data as string) as GatewayPayload;
 		debugLog(this.env, () => ({ message: "Gateway received payload", payload }));
 		// Persisted on every frame, not batched: a RESUME replays every dispatch after the stored
-		// sequence, and a replayed MESSAGE_CREATE after an eviction would be replied to twice.
-		if (payload.s != null) {
-			this.sequence = payload.s;
+		// sequence, and a replayed MESSAGE_CREATE after an eviction would be replied to twice. Only
+		// updates an existing session — READY (below) sets the session's starting sequence itself, since
+		// this runs before a fresh connect's session exists yet.
+		if (payload.s != null && this.session) {
+			this.session.sequence = payload.s;
 			await this.ctx.storage.put("sequence", payload.s);
 		}
 
@@ -224,9 +256,7 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private async clearSession(): Promise<void> {
-		this.sessionId = undefined;
-		this.resumeGatewayUrl = undefined;
-		this.sequence = null;
+		this.session = null;
 		await this.ctx.storage.delete(["sessionId", "resumeGatewayUrl", "sequence"]);
 	}
 
@@ -235,13 +265,17 @@ export class DiscordGateway extends DurableObject<Env> {
 			case "READY": {
 				const ready = payload.d as ReadyDispatchData;
 				console.log({ message: "Gateway READY", userId: ready.user.id });
-				this.sessionId = ready.session_id;
-				this.resumeGatewayUrl = ready.resume_gateway_url;
+				// READY is itself a Dispatch, so `payload.s` is this session's starting sequence — the
+				// `?? 0` fallback only guards the envelope's looser `number | null` type, since Discord
+				// always sends a real sequence on a Dispatch.
+				this.session = { id: ready.session_id, resumeUrl: ready.resume_gateway_url, sequence: payload.s ?? 0 };
 				this.botUserId = ready.user.id;
 				this.botUsername = ready.user.username;
+				this.reconnectAttempts = 0;
 				await this.ctx.storage.put({
-					sessionId: ready.session_id,
-					resumeGatewayUrl: ready.resume_gateway_url,
+					sessionId: this.session.id,
+					resumeGatewayUrl: this.session.resumeUrl,
+					sequence: this.session.sequence,
 					botUserId: ready.user.id,
 					botUsername: ready.user.username,
 				});
@@ -249,6 +283,7 @@ export class DiscordGateway extends DurableObject<Env> {
 			}
 			case "RESUMED":
 				console.log({ message: "Gateway RESUMED" });
+				this.reconnectAttempts = 0;
 				break;
 			case "MESSAGE_CREATE": {
 				const message = payload.d as MessageCreateDispatchData;
@@ -268,11 +303,11 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private async identifyOrResume(): Promise<void> {
-		if (this.sessionId && this.sequence !== null) {
+		if (this.session) {
 			const resume: ResumeData = {
 				token: this.env.DISCORD_TOKEN,
-				session_id: this.sessionId,
-				seq: this.sequence,
+				session_id: this.session.id,
+				seq: this.session.sequence,
 			};
 			this.send({ op: GatewayOpcode.Resume, d: resume });
 			return;
@@ -309,7 +344,7 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private sendHeartbeat(): void {
-		this.send({ op: GatewayOpcode.Heartbeat, d: this.sequence });
+		this.send({ op: GatewayOpcode.Heartbeat, d: this.session?.sequence ?? null });
 	}
 
 	private send(payload: { op: GatewayOpcode; d: unknown }): void {

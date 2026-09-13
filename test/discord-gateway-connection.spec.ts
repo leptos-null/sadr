@@ -114,12 +114,15 @@ describe("DiscordGateway connection", () => {
 		vi.restoreAllMocks();
 		// Closing from the server side runs the bot's close handler, which clears its heartbeat timer.
 		// Evicting the instance instead would wait on the open socket and leave its listeners pointing at
-		// a dead instance. The alarm goes too, so this instance can't reconnect into a later test.
-		await runInDurableObject(stub, (_instance, state) => {
+		// a dead instance. The alarm goes too, so this instance can't reconnect into a later test — deleted
+		// only after the close event has been delivered (MSW dispatches it on a later tick), since the
+		// bot's close handler pulls the alarm forward and would otherwise re-arm it after the delete.
+		await runInDurableObject(stub, async (_instance, state) => {
 			for (const connection of openConnections) {
 				if (connection.closeCode === undefined) connection.client.close(1000);
 			}
-			return state.storage.deleteAlarm();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			await state.storage.deleteAlarm();
 		});
 		openConnections.length = 0;
 	});
@@ -181,6 +184,21 @@ describe("DiscordGateway connection", () => {
 
 		await vi.waitFor(() => expect(received(connections[1], 6)).toBeDefined());
 		expect(connections[0].closeCode).toBe(4000);
+	});
+
+	it("reconnects after an unexpected close without waiting for the next keep-alive tick", async () => {
+		mockRest();
+		const connections = serveGateway(GATEWAY_URL);
+		stub = env.DISCORD_GATEWAY.getByName("unexpected-close-reconnect-test");
+		await stub.ensureConnected();
+		await waitForSession();
+
+		await fromServer(() => connections[0].client.close(4000)); // an ordinary Discord-side close, not our own teardown or an op 7
+
+		// Nothing here calls ensureConnected() or runs the alarm by hand — the reconnect has to come from
+		// the close handler pulling the keep-alive alarm forward. The stored session is still intact (4000
+		// isn't a non-resumable code), so the new socket resumes (op 6) rather than re-identifying.
+		await vi.waitFor(() => expect(received(connections[1], 6)).toBeDefined(), { timeout: 3000 });
 	});
 
 	it("resumes on a new socket after a resumable Invalid Session", async () => {
