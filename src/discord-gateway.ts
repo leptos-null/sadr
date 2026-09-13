@@ -35,6 +35,7 @@ const RESUMABLE_CLOSE_CODE = 4000;
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
 	private heartbeatIntervalId?: ReturnType<typeof setInterval>;
+	private heartbeatAcked = true;
 	private sessionId?: string;
 	private resumeGatewayUrl?: string;
 	private sequence: number | null = null;
@@ -170,7 +171,9 @@ export class DiscordGateway extends DurableObject<Env> {
 			case GatewayOpcode.Dispatch:
 				await this.handleDispatch(payload);
 				break;
-			// HeartbeatAck: nothing to do.
+			case GatewayOpcode.HeartbeatAck:
+				this.heartbeatAcked = true;
+				break;
 		}
 	}
 
@@ -228,8 +231,21 @@ export class DiscordGateway extends DurableObject<Env> {
 
 	private startHeartbeat(intervalMs: number): void {
 		if (this.heartbeatIntervalId) clearInterval(this.heartbeatIntervalId);
+		this.heartbeatAcked = true;
 		this.sendHeartbeat();
-		this.heartbeatIntervalId = setInterval(() => this.sendHeartbeat(), intervalMs);
+		this.heartbeatIntervalId = setInterval(() => {
+			// No ACK since the last interval heartbeat means a zombied connection. Only this path
+			// clears the flag, so a Discord-requested heartbeat's in-flight ACK can't look like one.
+			if (!this.heartbeatAcked) {
+				console.warn({ message: "Gateway heartbeat not acknowledged, reconnecting" });
+				this.connectToGateway().catch((error) =>
+					console.error({ message: "Gateway reconnect after missed heartbeat ACK failed", error: errorMessage(error) }, error),
+				);
+				return;
+			}
+			this.heartbeatAcked = false;
+			this.sendHeartbeat();
+		}, intervalMs);
 	}
 
 	private sendHeartbeat(): void {
