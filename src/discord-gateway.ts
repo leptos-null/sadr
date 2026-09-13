@@ -156,13 +156,14 @@ export class DiscordGateway extends DurableObject<Env> {
 				const resumable = payload.d as boolean;
 				if (resumable) {
 					console.warn({ message: "Gateway invalid session, will resume" });
-				} else {
-					console.error({ message: "Gateway invalid session, not resumable (likely a bad token or invalid intents)" });
-					this.sessionId = undefined;
-					this.resumeGatewayUrl = undefined;
-					this.sequence = null;
-					await this.ctx.storage.delete(["sessionId", "resumeGatewayUrl", "sequence"]);
+					await this.connectToGateway();
+					break;
 				}
+				console.error({ message: "Gateway invalid session, not resumable (likely a bad token or invalid intents)" });
+				this.sessionId = undefined;
+				this.resumeGatewayUrl = undefined;
+				this.sequence = null;
+				await this.ctx.storage.delete(["sessionId", "resumeGatewayUrl", "sequence"]);
 				// Discord recommends a short random delay before re-identifying after an invalid session.
 				await delay(1000 + Math.random() * 4000);
 				await this.identifyOrResume();
