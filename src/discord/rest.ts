@@ -94,25 +94,9 @@ function rateLimitRetryMs(response: Response): number | null {
 /**
  * Makes a Discord REST call with bot auth, logging the request at debug level, retrying a
  * short-lived 429, and throwing a `DiscordApiError` on failure. `path` is relative to `API_BASE`
- * and should include any query string. With `allowMissing`, a 404 is treated as "doesn't exist"
- * rather than a failure — returns null instead of throwing, for a lookup where that's a normal,
- * expected outcome (e.g. checking whether a user is a member of a guild) rather than an error.
+ * and should include any query string.
  */
-async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response>;
-async function discordFetch(
-	env: Env,
-	method: string,
-	path: string,
-	body: unknown,
-	options: { allowMissing: true },
-): Promise<Response | null>;
-async function discordFetch(
-	env: Env,
-	method: string,
-	path: string,
-	body?: unknown,
-	options?: { allowMissing?: boolean },
-): Promise<Response | null> {
+async function discordFetch(env: Env, method: string, path: string, body?: unknown): Promise<Response> {
 	debugLog(env, () => ({ message: "Discord REST request", method, path, body }));
 	// Unbounded on purpose: the retry budget is spent via `attempt` below, and bounding the loop
 	// itself would add a tail the compiler demands but nothing can reach.
@@ -120,7 +104,6 @@ async function discordFetch(
 		const response = await sendOnce(env, method, path, body);
 		const retryMs = attempt < MAX_RATE_LIMIT_RETRIES ? rateLimitRetryMs(response) : null;
 		if (retryMs === null) {
-			if (options?.allowMissing && response.status === 404) return null;
 			if (!response.ok) {
 				throw new DiscordApiError(response.status, `${method} ${path} failed: ${response.status} ${await response.text()}`);
 			}
@@ -132,7 +115,12 @@ async function discordFetch(
 	}
 }
 
-/** As `discordFetch`, for the endpoints that return a JSON body worth tracing. */
+/**
+ * As `discordFetch`, for the endpoints that return a JSON body worth tracing. With `allowMissing`,
+ * a 404 is treated as "doesn't exist" rather than a failure — returns null instead of throwing, for
+ * a lookup where that's a normal, expected outcome (e.g. checking whether a user is a member of a
+ * guild) rather than an error.
+ */
 async function discordJson<T>(env: Env, method: string, path: string, body?: unknown): Promise<T>;
 async function discordJson<T>(
 	env: Env,
@@ -148,8 +136,13 @@ async function discordJson<T>(
 	body?: unknown,
 	options?: { allowMissing: true },
 ): Promise<T | null> {
-	const response = options ? await discordFetch(env, method, path, body, options) : await discordFetch(env, method, path, body);
-	if (!response) return null;
+	let response: Response;
+	try {
+		response = await discordFetch(env, method, path, body);
+	} catch (error) {
+		if (options?.allowMissing && error instanceof DiscordApiError && error.status === 404) return null;
+		throw error;
+	}
 	const data = (await response.json()) as T;
 	debugLog(env, () => ({ message: "Discord REST response", method, path, data }));
 	return data;
