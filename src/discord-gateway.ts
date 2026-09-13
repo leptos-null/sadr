@@ -71,7 +71,10 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private async connectIfNeeded(): Promise<void> {
-		if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
+		// CONNECTING counts as connected: replacing a socket mid-handshake leaks it, since the
+		// `this.ws !== ws` guards below then drop its events without closing it.
+		const state = this.ws?.readyState;
+		if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
 		await this.connectToGateway();
 	}
 
