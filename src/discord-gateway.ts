@@ -39,6 +39,7 @@ const FATAL_CLOSE_PAUSE_MS = 60 * 60_000;
 
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
+	private isConnecting = false;
 	/** The initial jitter timeout, then the interval; clearTimeout clears either. */
 	private heartbeatTimerId?: ReturnType<typeof setTimeout>;
 	private heartbeatAcked = true;
@@ -85,6 +86,8 @@ export class DiscordGateway extends DurableObject<Env> {
 		// `this.ws !== ws` guards below then drop its events without closing it.
 		const state = this.ws?.readyState;
 		if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return;
+		// A connect attempt awaiting REST has no socket yet, but is still in flight.
+		if (this.isConnecting) return;
 		const pausedUntil = await this.ctx.storage.get<number>("reconnectPausedUntil");
 		if (pausedUntil !== undefined && Date.now() < pausedUntil) {
 			console.warn({ message: "Gateway reconnect paused after a fatal close code", until: new Date(pausedUntil).toISOString() });
@@ -99,16 +102,23 @@ export class DiscordGateway extends DurableObject<Env> {
 		this.handleClose();
 		previous?.close(RESUMABLE_CLOSE_CODE);
 
-		// A RESUME never triggers a READY dispatch, so a session that only ever resumes (e.g. a DO
-		// restarted after this field was added) would otherwise never learn its own identity.
-		if (!this.botUserId || !this.botUsername) {
-			const me = await getCurrentUser(this.env);
-			this.botUserId = me.id;
-			this.botUsername = me.username;
-			await this.ctx.storage.put({ botUserId: me.id, botUsername: me.username });
-		}
+		// Nothing after the try yields, so the flag only needs to cover the awaits inside it.
 		const resuming = Boolean(this.resumeGatewayUrl && this.sessionId);
-		const url = resuming ? this.resumeGatewayUrl! : await getGatewayBotUrl(this.env);
+		let url: string;
+		this.isConnecting = true;
+		try {
+			// A RESUME never triggers a READY dispatch, so a session that only ever resumes (e.g. a DO
+			// restarted after this field was added) would otherwise never learn its own identity.
+			if (!this.botUserId || !this.botUsername) {
+				const me = await getCurrentUser(this.env);
+				this.botUserId = me.id;
+				this.botUsername = me.username;
+				await this.ctx.storage.put({ botUserId: me.id, botUsername: me.username });
+			}
+			url = resuming ? this.resumeGatewayUrl! : await getGatewayBotUrl(this.env);
+		} finally {
+			this.isConnecting = false;
+		}
 		console.log({ message: "Gateway connecting", mode: resuming ? "resume" : "fresh", url });
 		const ws = new WebSocket(`${url}?v=10&encoding=json`);
 		// Guard every handler against events from a socket this DO has since moved on from
