@@ -29,6 +29,9 @@ const INTENTS = 1 | (1 << 9) | (1 << 12) | (1 << 15);
 // connection — alive indefinitely.
 const KEEPALIVE_INTERVAL_MS = 60_000;
 
+// Closing with 1000/1001 invalidates the session; any other code leaves it resumable.
+const RESUMABLE_CLOSE_CODE = 4000;
+
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
 	private heartbeatIntervalId?: ReturnType<typeof setInterval>;
@@ -79,6 +82,11 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private async connectToGateway(): Promise<void> {
+		const previous = this.ws;
+		// Clearing this.ws first makes the old socket's close event a no-op (see the guards below).
+		this.handleClose();
+		previous?.close(RESUMABLE_CLOSE_CODE);
+
 		// A RESUME never triggers a READY dispatch, so a session that only ever resumes (e.g. a DO
 		// restarted after this field was added) would otherwise never learn its own identity.
 		if (!this.botUserId || !this.botUsername) {
@@ -141,7 +149,6 @@ export class DiscordGateway extends DurableObject<Env> {
 				break;
 			case GatewayOpcode.Reconnect:
 				console.log({ message: "Gateway told to reconnect" });
-				this.ws?.close();
 				await this.connectToGateway();
 				break;
 			case GatewayOpcode.InvalidSession: {
