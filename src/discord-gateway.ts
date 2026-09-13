@@ -180,11 +180,11 @@ export class DiscordGateway extends DurableObject<Env> {
 			}
 			this.scheduleReconnect();
 		});
+		// Logging only: the close that follows an error owns teardown and reconnect scheduling. Dropping
+		// this.ws here would make that close's guard ignore it, code and all (a fatal code would never pause).
 		ws.addEventListener("error", (event) => {
 			if (this.ws !== ws) return;
 			console.error({ message: "Gateway socket error" }, event);
-			this.handleClose();
-			this.scheduleReconnect();
 		});
 		this.ws = ws;
 	}
