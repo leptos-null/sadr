@@ -39,7 +39,8 @@ const FATAL_CLOSE_PAUSE_MS = 60 * 60_000;
 
 export class DiscordGateway extends DurableObject<Env> {
 	private ws?: WebSocket;
-	private heartbeatIntervalId?: ReturnType<typeof setInterval>;
+	/** The initial jitter timeout, then the interval; clearTimeout clears either. */
+	private heartbeatTimerId?: ReturnType<typeof setTimeout>;
 	private heartbeatAcked = true;
 	private sessionId?: string;
 	private resumeGatewayUrl?: string;
@@ -139,9 +140,9 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private handleClose(): void {
-		if (this.heartbeatIntervalId) {
-			clearInterval(this.heartbeatIntervalId);
-			this.heartbeatIntervalId = undefined;
+		if (this.heartbeatTimerId) {
+			clearTimeout(this.heartbeatTimerId);
+			this.heartbeatTimerId = undefined;
 		}
 		this.ws = undefined;
 	}
@@ -248,22 +249,26 @@ export class DiscordGateway extends DurableObject<Env> {
 	}
 
 	private startHeartbeat(intervalMs: number): void {
-		if (this.heartbeatIntervalId) clearInterval(this.heartbeatIntervalId);
+		if (this.heartbeatTimerId) clearTimeout(this.heartbeatTimerId);
 		this.heartbeatAcked = true;
-		this.sendHeartbeat();
-		this.heartbeatIntervalId = setInterval(() => {
-			// No ACK since the last interval heartbeat means a zombied connection. Only this path
-			// clears the flag, so a Discord-requested heartbeat's in-flight ACK can't look like one.
-			if (!this.heartbeatAcked) {
-				console.warn({ message: "Gateway heartbeat not acknowledged, reconnecting" });
-				this.connectToGateway().catch((error) =>
-					console.error({ message: "Gateway reconnect after missed heartbeat ACK failed", error: errorMessage(error) }, error),
-				);
-				return;
-			}
-			this.heartbeatAcked = false;
+		// Discord asks for a random offset before the first heartbeat, to spread reconnect load:
+		// <https://docs.discord.com/developers/events/gateway#heartbeat-interval>
+		this.heartbeatTimerId = setTimeout(() => {
 			this.sendHeartbeat();
-		}, intervalMs);
+			this.heartbeatTimerId = setInterval(() => {
+				// No ACK since the last interval heartbeat means a zombied connection. Only this path
+				// clears the flag, so a Discord-requested heartbeat's in-flight ACK can't look like one.
+				if (!this.heartbeatAcked) {
+					console.warn({ message: "Gateway heartbeat not acknowledged, reconnecting" });
+					this.connectToGateway().catch((error) =>
+						console.error({ message: "Gateway reconnect after missed heartbeat ACK failed", error: errorMessage(error) }, error),
+					);
+					return;
+				}
+				this.heartbeatAcked = false;
+				this.sendHeartbeat();
+			}, intervalMs);
+		}, intervalMs * Math.random());
 	}
 
 	private sendHeartbeat(): void {
