@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { getCurrentUser, getGatewayBotUrl } from "./discord/rest";
+import { getCurrentUser, getGatewayBot } from "./discord/rest";
 import { isAddressedToBot } from "./discord/mentions";
 import {
 	GatewayOpcode,
@@ -118,7 +118,19 @@ export class DiscordGateway extends DurableObject<Env> {
 				this.botUsername = me.username;
 				await this.ctx.storage.put({ botUserId: me.id, botUsername: me.username });
 			}
-			url = resuming ? this.resumeGatewayUrl! : await getGatewayBotUrl(this.env);
+			if (resuming) {
+				url = this.resumeGatewayUrl!;
+			} else {
+				const gateway = await getGatewayBot(this.env);
+				// One IDENTIFY past the daily limit resets the bot token, so stop short of it.
+				if (gateway.session_start_limit.remaining <= 0) {
+					const until = Date.now() + gateway.session_start_limit.reset_after;
+					console.error({ message: "Gateway IDENTIFY limit reached, pausing reconnects", until: new Date(until).toISOString() });
+					await this.ctx.storage.put("reconnectPausedUntil", until);
+					return;
+				}
+				url = gateway.url;
+			}
 		} finally {
 			this.isConnecting = false;
 		}

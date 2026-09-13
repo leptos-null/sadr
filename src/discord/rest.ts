@@ -155,10 +155,24 @@ async function discordJson<T>(
 	return data;
 }
 
-/** Fetches a fresh Gateway WebSocket URL for a new (non-resumed) connection. */
-export async function getGatewayBotUrl(env: Env): Promise<string> {
-	const { url } = await discordJson<{ url: string }>(env, "GET", "/gateway/bot");
-	return url;
+/** https://docs.discord.com/developers/events/gateway#session-start-limit-object */
+export interface SessionStartLimit {
+	total: number;
+	remaining: number;
+	reset_after: number;
+	max_concurrency: number;
+}
+
+/** https://docs.discord.com/developers/events/gateway#get-gateway-bot */
+export interface GatewayBot {
+	url: string;
+	shards: number;
+	session_start_limit: SessionStartLimit;
+}
+
+/** Fetches a fresh Gateway WebSocket URL for a new (non-resumed) connection, plus the remaining IDENTIFY budget. */
+export function getGatewayBot(env: Env): Promise<GatewayBot> {
+	return discordJson<GatewayBot>(env, "GET", "/gateway/bot");
 }
 
 /**

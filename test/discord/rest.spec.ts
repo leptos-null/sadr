@@ -4,27 +4,30 @@ import {
 	DiscordApiError,
 	getChannelMessages,
 	getCurrentUser,
-	getGatewayBotUrl,
+	getGatewayBot,
 	getGuildMember,
 	getThreadMember,
 	sendMessage,
 	triggerTyping,
 } from "../../src/discord/rest";
 
-describe("getGatewayBotUrl", () => {
+describe("getGatewayBot", () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
 
-	it("requests the bot gateway endpoint with bot auth and returns the url", async () => {
+	it("requests the bot gateway endpoint with bot auth and returns the url and session start limit", async () => {
 		env.DISCORD_TOKEN = "test-discord-token";
-		const fetchSpy = vi
-			.spyOn(globalThis, "fetch")
-			.mockResolvedValue(new Response(JSON.stringify({ url: "wss://gateway.discord.gg" }), { status: 200 }));
+		const gatewayBot = {
+			url: "wss://gateway.discord.gg",
+			shards: 1,
+			session_start_limit: { total: 1000, remaining: 999, reset_after: 14_400_000, max_concurrency: 1 },
+		};
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(gatewayBot), { status: 200 }));
 
-		const url = await getGatewayBotUrl(env);
+		const gateway = await getGatewayBot(env);
 
-		expect(url).toBe("wss://gateway.discord.gg");
+		expect(gateway).toEqual(gatewayBot);
 		const [requestUrl, init] = fetchSpy.mock.calls[0];
 		expect(requestUrl).toBe("https://discord.com/api/v10/gateway/bot");
 		expect(new Headers(init?.headers).get("Authorization")).toBe("Bot test-discord-token");
@@ -33,13 +36,13 @@ describe("getGatewayBotUrl", () => {
 	it("throws with response detail on failure", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad token", { status: 401 }));
 
-		await expect(getGatewayBotUrl(env)).rejects.toThrow(/401/);
+		await expect(getGatewayBot(env)).rejects.toThrow(/401/);
 	});
 
 	it("throws a DiscordApiError carrying the status, so a caller can recognize an expected failure", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("Missing Access", { status: 403 }));
 
-		const error = await getGatewayBotUrl(env).catch((caught: unknown) => caught);
+		const error = await getGatewayBot(env).catch((caught: unknown) => caught);
 
 		expect(error).toBeInstanceOf(DiscordApiError);
 		expect((error as DiscordApiError).status).toBe(403);
@@ -63,7 +66,7 @@ describe("slow Discord REST call warning", () => {
 		});
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-		await getGatewayBotUrl(env);
+		await getGatewayBot(env);
 
 		expect(warnSpy).toHaveBeenCalledWith(expect.objectContaining({ method: "GET", path: "/gateway/bot", durationMs: 3001 }));
 	});
@@ -74,7 +77,7 @@ describe("slow Discord REST call warning", () => {
 		);
 		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
-		await getGatewayBotUrl(env);
+		await getGatewayBot(env);
 
 		expect(warnSpy).not.toHaveBeenCalled();
 	});
