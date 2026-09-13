@@ -214,6 +214,23 @@ describe("DiscordGateway connection", () => {
 		expect(connections[0].closeCode).toBe(4000);
 	});
 
+	it("opens a fresh connection and re-identifies, not the existing socket, after a non-resumable Invalid Session", async () => {
+		const calls = mockRest();
+		const connections = serveGateway(GATEWAY_URL);
+		stub = env.DISCORD_GATEWAY.getByName("invalid-session-non-resumable-test");
+		await stub.ensureConnected();
+		await waitForSession();
+
+		await fromServer(() => connections[0].client.send(JSON.stringify({ op: 9, d: false, s: null, t: null })));
+
+		// The bot closes its own socket, and the close handler's backoff (1s first) schedules the
+		// reconnect. A cleared session means connectToGateway can't reuse a resume URL — it fetches a
+		// fresh one, same as the very first connect, and the new socket identifies rather than resumes.
+		await vi.waitFor(() => expect(received(connections[1], 2)).toBeDefined(), { timeout: 3000 });
+		expect(calls.gatewayBot).toBe(2);
+		expect(connections[0].closeCode).toBe(4000);
+	});
+
 	it("pauses reconnects after a fatal close code", async () => {
 		mockRest();
 		const connections = serveGateway(GATEWAY_URL);

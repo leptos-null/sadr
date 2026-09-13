@@ -10,7 +10,6 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
-import { delay } from "./delay";
 import { debugLog, errorMessage } from "./log-level";
 import { replyToMessage } from "./reply";
 
@@ -241,9 +240,9 @@ export class DiscordGateway extends DurableObject<Env> {
 				}
 				console.error({ message: "Gateway invalid session, not resumable (likely a bad token or invalid intents)" });
 				await this.clearSession();
-				// Discord recommends a short random delay before re-identifying after an invalid session.
-				await delay(1000 + Math.random() * 4000);
-				await this.identifyOrResume();
+				// Closing our own socket runs the close handler, whose backoff schedules the fresh connect —
+				// and keeps growing if Discord answers every IDENTIFY with another invalid session.
+				this.ws?.close(RESUMABLE_CLOSE_CODE);
 				break;
 			}
 			case GatewayOpcode.Dispatch:
