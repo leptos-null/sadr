@@ -116,10 +116,23 @@ function everyoneIsGranted(overwrites: readonly DiscordPermissionOverwrite[], bi
 }
 
 /**
- * `isAtLeastAsReadableAs` for one permission bit: three comparisons, each rejecting a way
- * `overwrites` could be the narrower of the two — the `@everyone` base case, an id
- * `referenceOverwrites` grants `bit` that `overwrites` doesn't, and an id `overwrites` denies it
- * that `referenceOverwrites` doesn't.
+ * Whether `overwrites` grants `bit` to literally everyone — `@everyone` itself granted, and no role
+ * or member overwrite carves out a deny. A channel like that can't exclude anyone `referenceOverwrites`
+ * lets in, so it's always at least as readable, without needing the per-id comparison below at all.
+ * This is the realistic "public channel linked from a private one" case: a wide-open channel usually
+ * has no overwrites whatsoever, so it would otherwise fail the per-id loop for lack of an explicit
+ * allow entry matching whatever role the private channel names.
+ */
+function grantedToEveryone(overwrites: readonly DiscordPermissionOverwrite[], bit: bigint, guildId: string): boolean {
+	if (!everyoneIsGranted(overwrites, bit, guildId)) return false;
+	return !overwrites.some((overwrite) => hasBit(overwrite.deny, bit));
+}
+
+/**
+ * `isAtLeastAsReadableAs` for one permission bit: `overwrites` passes outright when it's granted to
+ * everyone (`grantedToEveryone`); otherwise, three comparisons, each rejecting a way `overwrites`
+ * could be the narrower of the two — the `@everyone` base case, an id `referenceOverwrites` grants
+ * `bit` that `overwrites` doesn't, and an id `overwrites` denies it that `referenceOverwrites` doesn't.
  */
 function isAtLeastAsGrantedAs(
 	overwrites: readonly DiscordPermissionOverwrite[],
@@ -127,6 +140,8 @@ function isAtLeastAsGrantedAs(
 	bit: bigint,
 	guildId: string,
 ): boolean {
+	if (grantedToEveryone(overwrites, bit, guildId)) return true;
+
 	if (everyoneIsGranted(referenceOverwrites, bit, guildId) && !everyoneIsGranted(overwrites, bit, guildId)) {
 		return false;
 	}

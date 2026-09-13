@@ -221,6 +221,36 @@ describe("isAtLeastAsReadableAs", () => {
 		expect(isAtLeastAsReadableAs(channel(), null, hiddenHome, null)).toBe(true);
 	});
 
+	// A private home: @everyone denied, opened back up to one role. Shared by the two tests below.
+	const staffOnly = homeChannel({
+		permission_overwrites: [
+			{ id: GUILD_ID, type: 0, allow: "0", deny: "1024" },
+			{ id: "role-1", type: 0, allow: "1024", deny: "0" },
+		],
+	});
+
+	// The realistic version of the "public into private" case above: the private home isn't just
+	// @everyone-denied, it also opens itself to one role. The linked channel has no overwrites naming
+	// that role at all — it doesn't need one, since it's wide open to everyone including that role's
+	// members.
+	it("is true relaying a wide-open channel into a private one opened to a specific role", () => {
+		expect(isAtLeastAsReadableAs(channel(), null, staffOnly, null)).toBe(true);
+	});
+
+	// Same as above, but the linked channel isn't overwrite-free — it has its own (redundant, allow-only)
+	// overwrites. `grantedToEveryone` has to actually scan them for a deny rather than short-circuiting
+	// on an empty list.
+	it("is true relaying a channel with allow-only overwrites into a private one opened to a specific role", () => {
+		const openWithOverwrites = channel({
+			permission_overwrites: [
+				{ id: GUILD_ID, type: 0, allow: "1024", deny: "0" },
+				{ id: "role-2", type: 0, allow: "1024", deny: "0" },
+			],
+		});
+
+		expect(isAtLeastAsReadableAs(openWithOverwrites, null, staffOnly, null)).toBe(true);
+	});
+
 	it("is false when a role allowed into the home channel isn't allowed into the linked one", () => {
 		const linked = channel({
 			permission_overwrites: [{ id: GUILD_ID, type: 0, allow: "0", deny: "1024" }],
