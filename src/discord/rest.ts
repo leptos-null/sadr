@@ -186,7 +186,7 @@ export async function sendMessage(
 		// The model is handed raw mention tokens and can echo them back — including an @everyone it
 		// picked up from fetched history. "users" keeps deliberate user pings working while making an
 		// @everyone or role ping impossible to trigger from generated content. replied_user restores
-		// Discord's default-for-replies behaviour, which sending an allowed_mentions object at all
+		// Discord's default-for-replies behavior, which sending an allowed_mentions object at all
 		// would otherwise turn off.
 		allowed_mentions: { parse: ["users"], replied_user: true },
 	};
