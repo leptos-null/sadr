@@ -1,6 +1,17 @@
 # sadr
 
-A Discord bot that replies to `@mention`s in servers and to any message in a DM, using the Gemini API. Runs as a single Cloudflare Worker with a Durable Object holding a persistent Gateway connection (not slash commands / Interactions).
+A Discord bot that replies to `@mention`s in servers and to any message in a DM, using the Gemini API. Runs as a single Cloudflare Worker with a Durable Object holding a persistent Gateway connection.
+
+## Goals
+
+- Respond to messages with similar context that a human in the conversation would have
+    - Nearby messages in the channel
+    - Linked messages
+    - Channel name and topic
+    - Guild (server) name and description
+- Keep private messages private: the bot may have a wider level of access than other participants in a conversation - the bot should not include content from channels that other participants don't have access to
+
+At the time of writing, this project is designed to fit within the free tier for both [Cloudflare](<https://www.cloudflare.com/plans/>) and [Gemini API](<https://ai.google.dev/gemini-api/docs/pricing>).
 
 ## How it works
 
@@ -11,58 +22,61 @@ A Discord bot that replies to `@mention`s in servers and to any message in a DM,
 
 See `CLAUDE.md` for the full architecture writeup.
 
-## AI Disclaimer
+## Authorship
 
 Nearly all of the code in this repo was written by Claude. I make an effort to set the author accurately for each git commit, to reflect who wrote the code.
 
-I still reviewed and oversaw the development, including making architectural decisions.
+I still review and oversee the development, including making architectural decisions.
 
-## Setup
+## Running and deploying
 
-Requires [bun](https://bun.sh).
+Whether you're running locally or deploying to Cloudflare, you'll need the following:
 
-```sh
-bun install
-```
+1. Discord bot
+    1. I recommend separate bots for local development and a production deployment, to avoid both instances attempting to respond to the same message
+    2. If you don't yet have one, create a Discord bot: [Discord guide](<https://docs.discord.com/developers/quick-start/getting-started#step-1-creating-an-app>)
+        - Use this guide also to install the bot to a server
+    3. The bot must have "Message Content Intent" enabled in the Discord Developer Portal: [Discord guide](<https://docs.discord.com/developers/gateway/getting-started-with-privileged-intent-review#1-the-developer-portal>)
+2. Gemini API
+    1. It's technically fine to re-use the same API key between a local instance and a deployment. You may choose to use separate keys for organization or security.
+    2. If you don't yet have one, create a Gemini API key: [Google guide](<https://ai.google.dev/gemini-api/docs>)
 
-Create a `.dev.vars` file in the repo root with:
+### Local
 
-```
-DISCORD_TOKEN=...
-GEMINI_API_KEY=...
-```
+1. Place the 2 secrets from the steps above in `.dev.vars`:
+    ```txt
+    DISCORD_TOKEN=""
+    GEMINI_API_KEY=""
+    ```
+    - You may also choose to add the line
+        ```txt
+        LOG_LEVEL="debug"
+        ```
+        to this file to enable debug logging (only applies when running locally)
+2. Install package dependencies:
+    ```bash
+    bun install
+    ```
+    - You only need to do this when first cloning the repo or if `bun.lock` changed when pulling
+3. Run:
+    ```bash
+    bun run dev
+    ```
+    - The first time you run, you will likely need to manually start the Gateway connection, which you can do with:
+        ```bash
+        curl -sS "http://localhost:8787/" && echo
+        ```
+        You can also do this at any time, if the Gateway connection doesn't automatically connect.
 
-Your Discord bot needs the privileged **MESSAGE_CONTENT** intent enabled in the Discord Developer Portal, or the Gateway connection will be rejected.
+### Deploying
 
-## Local development
-
-```sh
-bun run dev
-```
-
-Starts `wrangler dev` on `http://localhost:8787`. Nothing auto-triggers the Gateway connection locally — hit the server once to fire it:
-
-```sh
-curl localhost:8787
-```
-
-The 5-minute self-heal cron doesn't run locally either; trigger it manually if needed:
-
-```sh
-curl "http://localhost:8787/cdn-cgi/local/scheduled"
-```
-
-## Testing
-
-```sh
-bun run test        # full suite
-bunx tsc --noEmit    # typecheck
-```
-
-## Deploying
-
-```sh
-wrangler secret put DISCORD_TOKEN
-wrangler secret put GEMINI_API_KEY
-bun run deploy
-```
+1. Provide the 2 secrets from the shared steps above to Cloudflare:
+    ```bash
+    wrangler secret put DISCORD_TOKEN
+    wrangler secret put GEMINI_API_KEY
+    ```
+    - Each of these commands will interactively prompt you to input the value for the secret
+2. Deploy:
+    ```bash
+    bun run deploy
+    ```
