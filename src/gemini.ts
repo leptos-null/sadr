@@ -286,9 +286,34 @@ async function callGemini(
 	return data;
 }
 
-/** A `HistoryMessage` as it actually goes on the wire: `channelId`/`author`/`mentionedUsers` live elsewhere in the payload. */
-function toPayloadMessage({ channelId: _channelId, author: _author, mentionedUsers: _mentionedUsers, ...rest }: HistoryMessage) {
-	return rest;
+/**
+ * A `HistoryMessage` as it actually goes on the wire. `channelId`, `author` and `mentionedUsers`
+ * are deliberately absent: the first groups the message in `channels`, the other two are folded into
+ * `users`. Spelled out rather than derived from `HistoryMessage`, so a new field there reaches the
+ * model only by being added here too — and `buildSystemInstruction` must describe whatever does.
+ */
+interface PayloadMessage {
+	id: string;
+	userId: string;
+	content: string;
+	date: string;
+	replyToId: string | null;
+	editedDate?: string;
+	attachments?: string[];
+	forwarded?: ForwardedMessage;
+}
+
+function toPayloadMessage(message: HistoryMessage): PayloadMessage {
+	return {
+		id: message.id,
+		userId: message.userId,
+		content: message.content,
+		date: message.date,
+		replyToId: message.replyToId,
+		editedDate: message.editedDate,
+		attachments: message.attachments,
+		forwarded: message.forwarded,
+	};
 }
 
 /** Every user any of `messages` names — as an author or a mention — keyed by id for `content` to look up. */
@@ -317,7 +342,7 @@ function buildContents(
 	);
 
 	/** An accessible channel's "channels" entry. An inaccessible one is exactly `{inaccessible: true}` instead — never a mix. */
-	type AccessibleChannelEntry = { name: string | null; topic: string | null; messages: unknown[] };
+	type AccessibleChannelEntry = { name: string | null; topic: string | null; messages: PayloadMessage[] };
 
 	// Seeded from every accessible channel, not just those with messages: a linked channel that fetched
 	// empty still needs an entry, or it's indistinguishable from a link the model was never shown.
