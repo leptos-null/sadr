@@ -52,6 +52,17 @@ export interface ForwardedMessage {
 	attachments?: string[];
 }
 
+/**
+ * A Discord system message, as given to Gemini. Discord posts these itself rather than a person
+ * writing them, so they carry no content of their own — `kind` is what happened, and `origin` is
+ * the message it happened to, which still exists where it was.
+ */
+export interface MessageNotice {
+	kind: "pinned" | "threadStarted";
+	/** Where that message lives. Resolved like `ForwardedMessage.origin`, and absent on the same terms. */
+	origin?: MessageLink;
+}
+
 /** A Discord message as given to Gemini. */
 export interface HistoryMessage {
 	id: string;
@@ -74,6 +85,8 @@ export interface HistoryMessage {
 	 * then only whatever its author wrote alongside the forward — usually empty.
 	 */
 	forwarded?: ForwardedMessage;
+	/** What happened, when Discord posted this message itself as a notice rather than someone writing it. */
+	notice?: MessageNotice;
 	/**
 	 * Other users `content` mentions, beyond the author — folded into `users` the same way, so a
 	 * mention of someone who hasn't posted in view can still be resolved to a name.
@@ -224,6 +237,7 @@ function buildSystemInstruction(
 		`A message may also have "attachments": ["filename", ...] for files or images it carries. You can't view them, but you can acknowledge them.`,
 		`A message may also have "editedDate" (ISO 8601) if it's been edited since it was first sent. There's no way to see what it originally said, so don't guess at the change — just be aware it happened.`,
 		`A message may also have "forwarded": {"content", "date", "origin"?, "editedDate"?, "attachments"?} — its author forwarded someone else's message instead of writing it, so the message's own "content" is only what they added alongside, usually nothing, and "forwarded.content" is the text they forwarded. You don't know who wrote it. "origin" is {"channelId", "messageId"} locating the original, which you can look up in "channels" if it's there.`,
+		`A message with "notice": {"kind", "origin"?} is one Discord posted itself, which is why its "content" is empty: "pinned" means "userId" pinned a message, "threadStarted" means "userId" started a thread from one (someone else may have written it). Either way "origin" is {"channelId", "messageId"} for the message it's about — look it up in "channels" if it's there.`,
 	];
 
 	// Counts down per call, so the model is told what it actually has left. At 0 the fetch tool is
@@ -301,6 +315,7 @@ interface PayloadMessage {
 	editedDate?: string;
 	attachments?: string[];
 	forwarded?: ForwardedMessage;
+	notice?: MessageNotice;
 }
 
 function toPayloadMessage(message: HistoryMessage): PayloadMessage {
@@ -313,6 +328,7 @@ function toPayloadMessage(message: HistoryMessage): PayloadMessage {
 		editedDate: message.editedDate,
 		attachments: message.attachments,
 		forwarded: message.forwarded,
+		notice: message.notice,
 	};
 }
 
@@ -419,12 +435,13 @@ export async function generateReply(
 	// "most recent in channel A" and "most recent in channel B" are different requests.
 	const fetchKey = (channelId: string, messageId: string | null) => `${channelId}:${messageId ?? ""}`;
 	const fetchedAnchors = new Set<string>([fetchKey(trigger.channelId, trigger.id)]);
-	// A forward's origin is resolved exactly like a link in the content: same permission check, same
-	// seed fetch. Put first, so the cap can't drop the message the trigger is actually about.
+	// The message a forward or a notice points at is resolved exactly like a link in the content: same
+	// permission check, same seed fetch. Put first, so the cap can't drop the message the trigger is
+	// actually about. A message is one or the other, never both — a forward is an ordinary message.
 	const links = extractMessageLinks(trigger.content);
-	const forwardOrigin = trigger.forwarded?.origin;
-	if (forwardOrigin && !links.some((link) => link.messageId === forwardOrigin.messageId)) {
-		links.unshift(forwardOrigin);
+	const triggerOrigin = trigger.forwarded?.origin ?? trigger.notice?.origin;
+	if (triggerOrigin && !links.some((link) => link.messageId === triggerOrigin.messageId)) {
+		links.unshift(triggerOrigin);
 	}
 	const candidateLinks = links.slice(0, MAX_MESSAGE_LINKS);
 	// Checked per channel, not per link: saves round-trips, and two links into one channel can't get

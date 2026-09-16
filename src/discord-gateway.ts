@@ -10,6 +10,7 @@ import {
 	type ReadyDispatchData,
 	type ResumeData,
 } from "./discord/gateway-types";
+import { MessageType } from "./discord/types";
 import { debugLog, errorMessage } from "./log-level";
 import { replyToMessage } from "./reply";
 
@@ -287,6 +288,10 @@ export class DiscordGateway extends DurableObject<Env> {
 			case "MESSAGE_CREATE": {
 				const message = payload.d as MessageCreateDispatchData;
 				if (message.author.bot) return;
+				// Discord posts a pin notice under the pinner's name, so in a DM it reads as addressed to
+				// the bot — which would have it answer a message nobody wrote. It still reaches the model
+				// as history (see `HistoryMessage.notice`), just never as something to reply to.
+				if (message.type === MessageType.ChannelPinnedMessage) return;
 				if (!this.botUserId || !this.botUsername) {
 					// Shouldn't happen in practice — connectToGateway() resolves identity via REST before
 					// the socket even opens — but kept as defense-in-depth.

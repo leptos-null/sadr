@@ -23,10 +23,26 @@ describe("toHistoryMessage", () => {
 
 	// A pin notice (6) and a thread starter (21) both carry a message_reference, and a thread starter's
 	// points at another channel entirely — read as a reply target, it anchors a seed fetch on a foreign id.
-	it.each([6, 21])("ignores the message_reference on a message of type %i", (type) => {
+	it.each([
+		[6, "pinned"],
+		[21, "threadStarted"],
+	])("maps the message_reference on a message of type %i to a %s notice, not a reply", (type, kind) => {
 		const notice = message({ type, content: "", message_reference: { type: 0, message_id: "777", channel_id: "2000" } });
 
-		expect(toHistoryMessage(notice).replyToId).toBeNull();
+		const history = toHistoryMessage(notice);
+
+		expect(history.replyToId).toBeNull();
+		expect(history.notice).toEqual({ kind, origin: { channelId: "2000", messageId: "777" } });
+	});
+
+	it("keeps a notice's kind when Discord didn't identify the message it's about", () => {
+		const notice = message({ type: 6, content: "" });
+
+		expect(toHistoryMessage(notice).notice).toEqual({ kind: "pinned", origin: undefined });
+	});
+
+	it("omits notice entirely for a message a person wrote", () => {
+		expect(toHistoryMessage(message({})).notice).toBeUndefined();
 	});
 
 	it("maps a forward's snapshot to forwarded, leaving replyToId null", () => {

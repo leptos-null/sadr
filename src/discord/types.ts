@@ -98,10 +98,19 @@ export interface DiscordAttachment {
 
 /**
  * The <https://docs.discord.com/developers/resources/message#message-object-message-types> this bot
- * distinguishes — only `Reply`, the one type whose `message_reference` is a reply target (see below).
+ * distinguishes. `Reply` is the only one whose `message_reference` is a reply target (see below); the
+ * other two are system notices whose reference is the message they're about.
  */
 export const MessageType = {
+	ChannelPinnedMessage: 6,
 	Reply: 19,
+	/**
+	 * A thread's first message, pointing back at the message it was started from. Verified live: its
+	 * `author` is whoever started the thread, not that message's author, and its `channel_id` is the
+	 * thread — which Discord gives the same id as the message it was started from, while
+	 * `message_reference.channel_id` is the parent channel that message is in.
+	 */
+	ThreadStarterMessage: 21,
 } as const;
 
 /**

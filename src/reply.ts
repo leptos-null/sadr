@@ -28,6 +28,7 @@ import {
 	type ForwardedMessage,
 	type GuildInfo,
 	type HistoryMessage,
+	type MessageNotice,
 	type UserInfo,
 } from "./gemini";
 import { errorMessage } from "./log-level";
@@ -62,6 +63,28 @@ function toForwardedMessage(message: DiscordMessage): ForwardedMessage | undefin
 	};
 }
 
+/** As `toHistoryMessage`, for a message Discord posted itself — nothing for one a person wrote. */
+function toMessageNotice(message: DiscordMessage): MessageNotice | undefined {
+	let kind: MessageNotice["kind"];
+	if (message.type === MessageType.ChannelPinnedMessage) {
+		kind = "pinned";
+	} else if (message.type === MessageType.ThreadStarterMessage) {
+		kind = "threadStarted";
+	} else {
+		return undefined;
+	}
+	// Both types' references are the message the notice is about: the one pinned, or the one the
+	// thread branched off — see `MessageType.ThreadStarterMessage` for why that one isn't in this channel.
+	const reference = message.message_reference;
+	return {
+		kind,
+		origin:
+			reference?.channel_id && reference.message_id
+				? { channelId: reference.channel_id, messageId: reference.message_id }
+				: undefined,
+	};
+}
+
 /**
  * Everyone a message mentions, deduped. A forward's snapshot carries its own `mentions` while the
  * outer array is empty (verified live), so both are merged; otherwise a `<@id>` in forwarded content
@@ -90,6 +113,7 @@ export function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 		attachments: message.attachments?.length ? message.attachments.map((attachment) => attachment.filename) : undefined,
 		mentionedUsers: toMentionedUsers(message),
 		forwarded: toForwardedMessage(message),
+		notice: toMessageNotice(message),
 	};
 }
 

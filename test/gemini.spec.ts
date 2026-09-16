@@ -375,6 +375,36 @@ describe("generateReply", () => {
 		expect(payload.channels[LINK_CHANNEL_ID].messages).toEqual([payloadMessage(original)]);
 	});
 
+	it("resolves a notice's origin from its own channel, like a link", async () => {
+		// A pin notice is the reachable case: in a DM every message is addressed to the bot, so one
+		// can be the trigger. A thread starter can't mention the bot, so it only ever shows up in history.
+		const noticeTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: "",
+			notice: { kind: "pinned", origin: { channelId: LINK_CHANNEL_ID, messageId: "777" } },
+		};
+		const pinned: HistoryMessage = {
+			id: "777",
+			channelId: LINK_CHANNEL_ID,
+			userId: "222",
+			author: { username: "bob", globalName: null },
+			content: "the pinned message",
+			date: "2023-12-31T00:00:00.000Z",
+			replyToId: null,
+		};
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [pinned] : []));
+
+		await generateReply(env, BOT, noticeTrigger, { fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel });
+
+		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[LINK_CHANNEL_ID].messages).toEqual([payloadMessage(pinned)]);
+	});
+
 	it("marks a denied forward origin's channel inaccessible rather than fetching it", async () => {
 		const forwardTrigger: HistoryMessage = {
 			...TRIGGER,
