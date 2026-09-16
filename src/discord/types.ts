@@ -96,20 +96,47 @@ export interface DiscordAttachment {
 	url: string;
 }
 
-export interface DiscordMessage {
-	id: string;
-	/** Always present on both transports. */
-	channel_id: string;
+/**
+ * The <https://docs.discord.com/developers/resources/message#message-object-message-types> this bot
+ * distinguishes — only `Reply`, the one type whose `message_reference` is a reply target (see below).
+ */
+export const MessageType = {
+	Reply: 19,
+} as const;
+
+/**
+ * What a message says, shared by a whole message and by a forward's copy of one (`message_snapshots`,
+ * which carries this subset and notably no `id` or `author`).
+ */
+export interface DiscordMessageCore {
+	/** Compare against `MessageType`. On a forward's copy this is the *original* message's type. */
+	type: number;
 	content: string;
 	/** ISO 8601, as Discord provides it. */
 	timestamp: string;
-	author: DiscordUser;
-	/** Present when this message is a Discord reply to another message. */
-	message_reference?: { message_id?: string };
+	/** ISO 8601, or null if the message has never been edited. */
+	edited_timestamp?: string | null;
 	/** Files/images the message carries. Always sent as an array (possibly empty) by Discord. */
 	attachments?: DiscordAttachment[];
 	/** Users mentioned in `content`; Discord resolves this itself, independent of who's actually posted. */
 	mentions?: DiscordUser[];
-	/** ISO 8601, or null if the message has never been edited. */
-	edited_timestamp?: string | null;
+}
+
+export interface DiscordMessage extends DiscordMessageCore {
+	id: string;
+	/** Always present on both transports. */
+	channel_id: string;
+	author: DiscordUser;
+	/**
+	 * Generic attribution, not reply-only: replies (`type` 19), pin notices (6), thread starters
+	 * (21), crossposts and forwards all carry one, and only a reply's points at a message in this
+	 * same channel. For a forward, it locates the original of `message_snapshots[0]`.
+	 * <https://docs.discord.com/developers/resources/message#message-reference-content-attribution>
+	 */
+	message_reference?: { type?: number; message_id?: string; channel_id?: string; guild_id?: string };
+	/**
+	 * A forward's immutable copy of the original. Discord currently sends at most one.
+	 * <https://docs.discord.com/developers/resources/message#message-snapshot-structure>
+	 */
+	message_snapshots?: Array<{ message: DiscordMessageCore }>;
 }

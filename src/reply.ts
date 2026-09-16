@@ -13,6 +13,7 @@ import { canReadChannel, isAtLeastAsReadableAs } from "./discord/permissions";
 import {
 	ChannelType,
 	isThread,
+	MessageType,
 	type DiscordChannel,
 	type DiscordGuild,
 	type DiscordGuildMember,
@@ -24,6 +25,7 @@ import {
 	type BotIdentity,
 	type ChannelInfo,
 	type DiscordReader,
+	type ForwardedMessage,
 	type GuildInfo,
 	type HistoryMessage,
 	type UserInfo,
@@ -42,8 +44,39 @@ function toUserInfo(user: DiscordUser): UserInfo {
 	return { username: user.username, globalName: user.global_name ?? null };
 }
 
+/** As `toHistoryMessage`, for the original a forward carries — nothing for a message that isn't one. */
+function toForwardedMessage(message: DiscordMessage): ForwardedMessage | undefined {
+	const snapshot = message.message_snapshots?.[0]?.message;
+	if (!snapshot) return undefined;
+	// Only a forward has a snapshot, so its reference is the original's location, not a reply target.
+	const reference = message.message_reference;
+	return {
+		origin:
+			reference?.channel_id && reference.message_id
+				? { channelId: reference.channel_id, messageId: reference.message_id }
+				: undefined,
+		content: snapshot.content,
+		date: snapshot.timestamp,
+		editedDate: snapshot.edited_timestamp ?? undefined,
+		attachments: snapshot.attachments?.length ? snapshot.attachments.map((attachment) => attachment.filename) : undefined,
+	};
+}
+
+/**
+ * Everyone a message mentions, deduped. A forward's snapshot carries its own `mentions` while the
+ * outer array is empty (verified live), so both are merged; otherwise a `<@id>` in forwarded content
+ * resolves to nothing.
+ */
+function toMentionedUsers(message: DiscordMessage): Array<{ id: string } & UserInfo> | undefined {
+	const mentioned = new Map<string, { id: string } & UserInfo>();
+	for (const user of [...(message.mentions ?? []), ...(message.message_snapshots?.[0]?.message.mentions ?? [])]) {
+		mentioned.set(user.id, { id: user.id, ...toUserInfo(user) });
+	}
+	return mentioned.size ? [...mentioned.values()] : undefined;
+}
+
 /** Maps either transport's message shape — both extend `DiscordMessage` — to what Gemini is given. */
-function toHistoryMessage(message: DiscordMessage): HistoryMessage {
+export function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 	return {
 		id: message.id,
 		channelId: message.channel_id,
@@ -51,12 +84,12 @@ function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 		author: toUserInfo(message.author),
 		content: message.content,
 		date: message.timestamp,
-		replyToId: message.message_reference?.message_id ?? null,
+		// Only a reply's reference is a reply target — see `DiscordMessage.message_reference`.
+		replyToId: message.type === MessageType.Reply ? (message.message_reference?.message_id ?? null) : null,
 		editedDate: message.edited_timestamp ?? undefined,
 		attachments: message.attachments?.length ? message.attachments.map((attachment) => attachment.filename) : undefined,
-		mentionedUsers: message.mentions?.length
-			? message.mentions.map((mentioned) => ({ id: mentioned.id, ...toUserInfo(mentioned) }))
-			: undefined,
+		mentionedUsers: toMentionedUsers(message),
+		forwarded: toForwardedMessage(message),
 	};
 }
 

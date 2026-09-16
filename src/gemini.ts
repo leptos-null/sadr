@@ -1,4 +1,4 @@
-import { extractMessageLinks } from "./discord/message-links";
+import { extractMessageLinks, type MessageLink } from "./discord/message-links";
 import { debugLog, errorMessage } from "./log-level";
 
 const MODEL = "gemini-3.5-flash-lite";
@@ -18,7 +18,7 @@ const SEED_FETCH_LIMIT = 50;
  * latency/cost the way the free initial seed can.
  */
 const TOOL_FETCH_LIMIT = 20;
-/** Caps how many message links in a single trigger get resolved, so a link-spammed message can't turn into an unbounded fan-out of fetches. */
+/** Caps how many links (and a forward's origin) in a single trigger get resolved, so a link-spammed message can't turn into an unbounded fan-out of fetches. */
 const MAX_MESSAGE_LINKS = 3;
 /**
  * Discord's hard cap on message content. Not enforced locally: the model is asked to stay within it,
@@ -34,6 +34,22 @@ export interface UserInfo {
 	username: string;
 	/** Discord's account-wide display name; null if the user hasn't set one, in which case Discord itself falls back to showing `username`. */
 	globalName: string | null;
+}
+
+/** The original message a forward carries, as given to Gemini. Discord's copy of it has no author and no id of its own. */
+export interface ForwardedMessage {
+	/**
+	 * Where the original lives. Resolved like a message link when this is the trigger's own forward
+	 * (see `generateReply`); on a message from history it's an unresolved label.
+	 */
+	origin?: MessageLink;
+	content: string;
+	/** ISO 8601 — when the *original* was sent, which can long predate the forward. */
+	date: string;
+	/** As `HistoryMessage.editedDate`, for the original. */
+	editedDate?: string;
+	/** As `HistoryMessage.attachments`, for the original. */
+	attachments?: string[];
 }
 
 /** A Discord message as given to Gemini. */
@@ -53,6 +69,11 @@ export interface HistoryMessage {
 	editedDate?: string;
 	/** Filenames of files/images attached to the message. Omitted entirely when there are none. */
 	attachments?: string[];
+	/**
+	 * The message someone forwarded, when this message is a forward. The message's own `content` is
+	 * then only whatever its author wrote alongside the forward — usually empty.
+	 */
+	forwarded?: ForwardedMessage;
 	/**
 	 * Other users `content` mentions, beyond the author — folded into `users` the same way, so a
 	 * mention of someone who hasn't posted in view can still be resolved to a name.
@@ -194,7 +215,7 @@ function buildSystemInstruction(
 			? '"guild" is {"name", "description"} for the Discord server this is happening in.'
 			: "This conversation is in a direct message — just you and the other person.",
 		'"channels" maps a Discord channel id to {"name", "topic", "messages"}: "messages" is every message you currently know from that channel, oldest first, including "trigger" itself.',
-		`A "channels" entry other than the one "trigger" points to came from a Discord message-link URL you were sent — a different channel with its own separate conversation, so don't assume shared context with it, and you can't reply-quote a message from it.`,
+		`Any other "channels" entry is a different channel with its own separate conversation — don't assume shared context with it, and you can't reply-quote a message from it.`,
 		gatherTurnsLeft > 0
 			? `${inaccessibleDescription} Don't call ${FETCH_HISTORY_FUNCTION} on it again, and don't guess at what it might contain.`
 			: `${inaccessibleDescription} Don't guess at what it might contain.`,
@@ -202,6 +223,7 @@ function buildSystemInstruction(
 		`"users" maps every user id you might see — a message's "userId", or an id inside a raw "<@id>" or "<@!id>" mention token in "content" — to {"username", "globalName"}. Prefer "globalName" when it isn't null; otherwise use "username".`,
 		`A message may also have "attachments": ["filename", ...] for files or images it carries. You can't view them, but you can acknowledge them.`,
 		`A message may also have "editedDate" (ISO 8601) if it's been edited since it was first sent. There's no way to see what it originally said, so don't guess at the change — just be aware it happened.`,
+		`A message may also have "forwarded": {"content", "date", "origin"?, "editedDate"?, "attachments"?} — its author forwarded someone else's message instead of writing it, so the message's own "content" is only what they added alongside, usually nothing, and "forwarded.content" is the text they forwarded. You don't know who wrote it. "origin" is {"channelId", "messageId"} locating the original, which you can look up in "channels" if it's there.`,
 	];
 
 	// Counts down per call, so the model is told what it actually has left. At 0 the fetch tool is
@@ -372,7 +394,14 @@ export async function generateReply(
 	// "most recent in channel A" and "most recent in channel B" are different requests.
 	const fetchKey = (channelId: string, messageId: string | null) => `${channelId}:${messageId ?? ""}`;
 	const fetchedAnchors = new Set<string>([fetchKey(trigger.channelId, trigger.id)]);
-	const candidateLinks = extractMessageLinks(trigger.content).slice(0, MAX_MESSAGE_LINKS);
+	// A forward's origin is resolved exactly like a link in the content: same permission check, same
+	// seed fetch. Put first, so the cap can't drop the message the trigger is actually about.
+	const links = extractMessageLinks(trigger.content);
+	const forwardOrigin = trigger.forwarded?.origin;
+	if (forwardOrigin && !links.some((link) => link.messageId === forwardOrigin.messageId)) {
+		links.unshift(forwardOrigin);
+	}
+	const candidateLinks = links.slice(0, MAX_MESSAGE_LINKS);
 	// Checked per channel, not per link: saves round-trips, and two links into one channel can't get
 	// different answers (e.g. from one transient failure).
 	const candidateChannelIds = [...new Set(candidateLinks.map((link) => link.channelId))];

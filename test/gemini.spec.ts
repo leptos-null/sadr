@@ -343,6 +343,66 @@ describe("generateReply", () => {
 		);
 	});
 
+	it("resolves a forward's origin from its own channel, like a link", async () => {
+		const forwardTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: "",
+			forwarded: {
+				origin: { channelId: LINK_CHANNEL_ID, messageId: "777" },
+				content: "the original message",
+				date: "2023-12-31T00:00:00.000Z",
+			},
+		};
+		const original: HistoryMessage = {
+			id: "777",
+			channelId: LINK_CHANNEL_ID,
+			userId: "222",
+			author: { username: "bob", globalName: null },
+			content: "the original message",
+			date: "2023-12-31T00:00:00.000Z",
+			replyToId: null,
+		};
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [original] : []));
+
+		await generateReply(env, BOT, forwardTrigger, { fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel });
+
+		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[LINK_CHANNEL_ID].messages).toEqual([payloadMessage(original)]);
+	});
+
+	it("marks a denied forward origin's channel inaccessible rather than fetching it", async () => {
+		const forwardTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: "",
+			forwarded: {
+				origin: { channelId: LINK_CHANNEL_ID, messageId: "777" },
+				content: "the original message",
+				date: "2023-12-31T00:00:00.000Z",
+			},
+		};
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const denyAll = () => Promise.resolve(false);
+
+		await generateReply(env, BOT, forwardTrigger, { fetchGuild, fetchChannel, fetchAround, canReadLinkedChannel: denyAll });
+
+		// Only the trigger's own seed fetch: the origin is gated exactly like a link the asker can't read.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ inaccessible: true });
+		// The forwarded copy still reaches the model — only fetching more around it was denied.
+		const [trigger] = payload.channels[HOME_CHANNEL_ID].messages;
+		expect(trigger.forwarded.content).toBe("the original message");
+	});
+
 	it("keeps an entry for an accessible linked channel that resolved no messages", async () => {
 		const linkTrigger: HistoryMessage = {
 			...TRIGGER,

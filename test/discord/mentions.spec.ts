@@ -8,6 +8,7 @@ function message(overrides: Partial<MessageCreateDispatchData>): MessageCreateDi
 	return {
 		id: "1",
 		channel_id: "chan",
+		type: 0,
 		content: "",
 		timestamp: "2024-01-01T00:00:00.000Z",
 		author: { id: "user", username: "user" },
