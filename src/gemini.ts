@@ -94,16 +94,20 @@ export interface HistoryMessage {
 	mentionedUsers?: Array<{ id: string } & UserInfo>;
 }
 
+/** A Discord guild (server), as given to Gemini via the shared `guilds` map rather than repeated on each of its channels. */
+export interface GuildInfo {
+	name: string;
+	description: string | null;
+}
+
 /** A Discord channel's metadata, keyed by channel id in the wire payload's `channels` map. */
 export interface ChannelInfo {
 	name: string | null;
 	topic: string | null;
-}
-
-/** The Discord guild (server) a reply is being generated for, or null for a DM (which has none). */
-export interface GuildInfo {
-	name: string;
-	description: string | null;
+	/**
+	 * The guild this channel is in, or null for a DM channel, which has none.
+	 */
+	guild: ({ id: string } & GuildInfo) | null;
 }
 
 export interface ReplyResult {
@@ -119,8 +123,13 @@ export interface BotIdentity {
 
 /** How `generateReply` reads Discord — passed in rather than imported, keeping REST out of this module. */
 export interface DiscordReader {
-	/** Null for a DM, which has no guild. */
-	fetchGuild: () => Promise<GuildInfo | null>;
+	/**
+	 * Whether the trigger is a DM rather than a guild message. Stated by the caller, which knows it
+	 * from the dispatch, rather than inferred from a missing guild — a fetch that failed would
+	 * otherwise be indistinguishable from a DM, and the model would be told the wrong one.
+	 */
+	isDirectMessage: boolean;
+	/** A channel's own metadata, its guild included. Null when there's nothing to report (a DM channel). */
 	fetchChannel: (channelId: string) => Promise<ChannelInfo | null>;
 	/** `messageId: null` fetches the channel's most recent messages instead. */
 	fetchAround: (channelId: string, messageId: string | null, limit: number) => Promise<HistoryMessage[]>;
@@ -216,7 +225,7 @@ const sendReplyDeclaration = {
 
 function buildSystemInstruction(
 	bot: BotIdentity,
-	guild: GuildInfo | null,
+	isDirectMessage: boolean,
 	gatherTurnsLeft: number,
 ): { parts: Array<{ text: string }> } {
 	// Only the trailing instruction differs: the 0 branch can't name the withheld tool (see callGemini).
@@ -224,11 +233,12 @@ function buildSystemInstruction(
 	const lines = [
 		`You are "${bot.username}", a Discord bot with user id "${bot.id}". Every response must be a function call.`,
 		`"trigger" is {"channelId", "messageId"} identifying the message that prompted this reply — look it up in "channels" for its content. That channel is the one you'll reply in; the remaining fields serve only as context.`,
-		guild
-			? '"guild" is {"name", "description"} for the Discord server this is happening in.'
-			: "This conversation is in a direct message — just you and the other person.",
-		'"channels" maps a Discord channel id to {"name", "topic", "messages"}: "messages" is every message you currently know from that channel, oldest first, including "trigger" itself.',
-		`Any other "channels" entry is a different channel with its own separate conversation — don't assume shared context with it, and you can't reply-quote a message from it.`,
+		isDirectMessage
+			? "This conversation is in a direct message — just you and the other person."
+			: `This conversation is in a Discord server; "guildId" on "trigger"'s channel says which one.`,
+		'"channels" maps a Discord channel id to {"name", "topic", "guildId", "messages"}: "messages" is every message you currently know from that channel, oldest first, including "trigger" itself.',
+		`"guilds" maps a Discord server id to {"name", "description"}; a channel's "guildId" is the server it belongs to, and is null for a direct message or when that channel's details couldn't be loaded.`,
+		`Any other "channels" entry is a different channel with its own separate conversation, possibly in a different server — don't assume shared context with it, and you can't reply-quote a message from it.`,
 		gatherTurnsLeft > 0
 			? `${inaccessibleDescription} Don't call ${FETCH_HISTORY_FUNCTION} on it again, and don't guess at what it might contain.`
 			: `${inaccessibleDescription} Don't guess at what it might contain.`,
@@ -271,14 +281,14 @@ async function callGemini(
 	env: Env,
 	contents: Content[],
 	bot: BotIdentity,
-	guild: GuildInfo | null,
+	isDirectMessage: boolean,
 	gatherTurnsLeft: number,
 ): Promise<GenerateContentResponse> {
 	const functionDeclarations =
 		gatherTurnsLeft > 0 ? [fetchHistoryDeclaration, sendReplyDeclaration] : [sendReplyDeclaration];
 	const requestBody: GenerateContentRequest = {
 		contents,
-		systemInstruction: buildSystemInstruction(bot, guild, gatherTurnsLeft),
+		systemInstruction: buildSystemInstruction(bot, isDirectMessage, gatherTurnsLeft),
 		tools: [{ functionDeclarations }],
 		toolConfig: { functionCallingConfig: { mode: "ANY" } },
 	};
@@ -332,6 +342,17 @@ function toPayloadMessage(message: HistoryMessage): PayloadMessage {
 	};
 }
 
+/** Every guild any of `channelInfos` belongs to, keyed by id for a channel's `guildId` to look up. */
+function collectGuilds(channelInfos: Iterable<ChannelInfo | null>): Record<string, GuildInfo> {
+	const guilds: Record<string, GuildInfo> = {};
+	for (const channelInfo of channelInfos) {
+		if (!channelInfo?.guild) continue;
+		const { id, ...info } = channelInfo.guild;
+		guilds[id] = info;
+	}
+	return guilds;
+}
+
 /** Every user any of `messages` names — as an author or a mention — keyed by id for `content` to look up. */
 function collectUsers(messages: HistoryMessage[]): Record<string, UserInfo> {
 	const users: Record<string, UserInfo> = {};
@@ -346,7 +367,6 @@ function collectUsers(messages: HistoryMessage[]): Record<string, UserInfo> {
 function buildContents(
 	trigger: HistoryMessage,
 	resolved: Map<string, HistoryMessage>,
-	guild: GuildInfo | null,
 	channelInfoById: Map<string, ChannelInfo | null>,
 	inaccessibleChannelIds: Set<string>,
 ): Content[] {
@@ -358,13 +378,28 @@ function buildContents(
 	);
 
 	/** An accessible channel's "channels" entry. An inaccessible one is exactly `{inaccessible: true}` instead — never a mix. */
-	type AccessibleChannelEntry = { name: string | null; topic: string | null; messages: PayloadMessage[] };
+	type AccessibleChannelEntry = {
+		name: string | null;
+		topic: string | null;
+		/**
+		 * A key into the payload's `guilds` map, the way a message's `userId` keys into `users`. Null
+		 * either because the channel has no guild (a DM) or because its info fetch failed, so it never
+		 * on its own means "this is a DM" — see `DiscordReader.isDirectMessage`.
+		 */
+		guildId: string | null;
+		messages: PayloadMessage[];
+	};
 
 	// Seeded from every accessible channel, not just those with messages: a linked channel that fetched
 	// empty still needs an entry, or it's indistinguishable from a link the model was never shown.
 	const accessibleChannels: Record<string, AccessibleChannelEntry> = {};
 	for (const [channelId, info] of channelInfoById) {
-		accessibleChannels[channelId] = { name: info?.name ?? null, topic: info?.topic ?? null, messages: [] };
+		accessibleChannels[channelId] = {
+			name: info?.name ?? null,
+			topic: info?.topic ?? null,
+			guildId: info?.guild?.id ?? null,
+			messages: [],
+		};
 	}
 	for (const message of sorted) {
 		const channel = accessibleChannels[message.channelId];
@@ -376,10 +411,11 @@ function buildContents(
 	for (const channelId of inaccessibleChannelIds) {
 		channels[channelId] = { inaccessible: true };
 	}
+
 	const payloadText = JSON.stringify({
-		...(guild ? { guild } : {}),
 		channels,
 		trigger: { channelId: trigger.channelId, messageId: trigger.id },
+		guilds: collectGuilds(channelInfoById.values()),
 		users: collectUsers(sorted),
 	});
 
@@ -413,8 +449,8 @@ function toReplyResult(
  * always ask for is seeded up front: the messages around the trigger, around its reply target if it's
  * a reply, and around each Discord message link in its content — the last only for channels
  * `discord.canReadLinkedChannel` clears, with a denied channel marked `inaccessible` instead. Each
- * channel's name/topic and the guild's name/description are fetched too; there are no tools for
- * those, so this is the model's only way to see them.
+ * channel's own name/topic/guild is fetched too; there are no tools for those, so this is the
+ * model's only way to see them.
  *
  * From there the model can call `fetch_message_history` for more context in any accessible channel,
  * and `send_reply` once ready. Every fetched message lands in one `resolved` map, and each Gemini call
@@ -447,11 +483,9 @@ export async function generateReply(
 	// Checked per channel, not per link: saves round-trips, and two links into one channel can't get
 	// different answers (e.g. from one transient failure).
 	const candidateChannelIds = [...new Set(candidateLinks.map((link) => link.channelId))];
-	// The guild and seed fetches don't depend on which channels pass the checks, so all three run
-	// together — a single check can cost several sequential round-trips that would otherwise sit in
-	// front of the seed fetch.
-	const [guild, triggerAround, channelChecks] = await Promise.all([
-		discord.fetchGuild(),
+	// The seed fetch doesn't depend on which channels pass the checks, so both run together — a single
+	// check can cost several sequential round-trips that would otherwise sit in front of the seed fetch.
+	const [triggerAround, channelChecks] = await Promise.all([
 		discord.fetchAround(trigger.channelId, trigger.id, SEED_FETCH_LIMIT),
 		Promise.all(
 			candidateChannelIds.map(async (channelId) => ({
@@ -478,7 +512,7 @@ export async function generateReply(
 	const channelIds = [...new Set([trigger.channelId, ...allowedChannelIds])];
 
 	// Neither kind of failure here fails the whole reply — it only leaves out what that fetch would have
-	// added: a channel's name/topic, or the messages around one link.
+	// added: a channel's name/topic/guild, or the messages around one link.
 	const [channelResults, linkResults] = await Promise.all([
 		Promise.all(
 			channelIds.map(async (id) => {
@@ -537,9 +571,9 @@ export async function generateReply(
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
 		const geminiResponse = await callGemini(
 			env,
-			buildContents(trigger, resolved, guild, channelInfoById, inaccessibleChannelIds),
+			buildContents(trigger, resolved, channelInfoById, inaccessibleChannelIds),
 			bot,
-			guild,
+			discord.isDirectMessage,
 			gatherTurnsLeft,
 		);
 

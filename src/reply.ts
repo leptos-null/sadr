@@ -118,13 +118,13 @@ export function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 }
 
 /** As `toHistoryMessage`, for the channel metadata Gemini is given. */
-function toChannelInfo(channel: DiscordChannel): ChannelInfo {
-	return { name: channel.name ?? null, topic: channel.topic ?? null };
+function toChannelInfo(channel: DiscordChannel, guild: ChannelInfo["guild"]): ChannelInfo {
+	return { name: channel.name ?? null, topic: channel.topic ?? null, guild };
 }
 
-/** As `toHistoryMessage`, for the guild metadata Gemini is given. */
-function toGuildInfo(guild: DiscordGuild): GuildInfo {
-	return { name: guild.name, description: guild.description };
+/** As `toHistoryMessage`, for the guild metadata Gemini is given — the id comes from the channel that named it. */
+function toGuildInfo(guildId: string, guild: DiscordGuild): { id: string } & GuildInfo {
+	return { id: guildId, name: guild.name, description: guild.description };
 }
 
 /**
@@ -157,13 +157,15 @@ export async function replyToMessage(env: Env, bot: BotIdentity, message: Messag
 
 /** The Discord reads `generateReply` makes while replying to `message`, message-link permission check included. */
 function createDiscordReader(env: Env, message: MessageCreateDispatchData): DiscordReader {
-	// Both caches are scoped to this one reply, so nothing is assumed fresh across replies, and
+	// All three caches are scoped to this one reply, so nothing is assumed fresh across replies, and
 	// hold the in-flight promise rather than the settled value: the permission checks run
 	// concurrently, and caching only settled values would let them all race past an empty
 	// cache. memberCache: links into the same guild look the asker up once. channelCache: the
 	// permission check and generateReply's channel-info fetch share one REST call per channel.
+	// guildCache: every channel in one guild — usually all of them — resolves it once.
 	const memberCache = new Map<string, Promise<DiscordGuildMember | null>>();
 	const channelCache = new Map<string, Promise<DiscordChannel>>();
+	const guildCache = new Map<string, Promise<DiscordGuild>>();
 	const getChannelCached = (channelId: string): Promise<DiscordChannel> => {
 		let channelPromise = channelCache.get(channelId);
 		if (!channelPromise) {
@@ -171,6 +173,14 @@ function createDiscordReader(env: Env, message: MessageCreateDispatchData): Disc
 			channelCache.set(channelId, channelPromise);
 		}
 		return channelPromise;
+	};
+	const getGuildCached = (guildId: string): Promise<DiscordGuild> => {
+		let guildPromise = guildCache.get(guildId);
+		if (!guildPromise) {
+			guildPromise = getGuild(env, guildId);
+			guildCache.set(guildId, guildPromise);
+		}
+		return guildPromise;
 	};
 	// The channel whose overwrites actually govern `channel` — itself, or for a thread its parent
 	// (see `DiscordChannel.parent_id`), since a thread has none of its own and would otherwise
@@ -191,12 +201,15 @@ function createDiscordReader(env: Env, message: MessageCreateDispatchData): Disc
 	};
 
 	return {
-		// A DM has no guild to fetch.
-		fetchGuild: async () => (message.guild_id ? toGuildInfo(await getGuild(env, message.guild_id)) : null),
+		isDirectMessage: !message.guild_id,
 		fetchChannel: async (channelId) => {
-			// A DM home channel is known to have no name/topic; a linked channel always gets a real call.
+			// A DM home channel is known to have no name/topic/guild; a linked channel always gets a real call.
 			if (channelId === message.channel_id && !message.guild_id) return null;
-			return toChannelInfo(await getChannelCached(channelId));
+			const channel = await getChannelCached(channelId);
+			// The channel's own guild_id, never the trigger's: a linked channel can be in another guild
+			// (and a link's URL doesn't say which — see MessageLink).
+			const guild = channel.guild_id ? toGuildInfo(channel.guild_id, await getGuildCached(channel.guild_id)) : null;
+			return toChannelInfo(channel, guild);
 		},
 		fetchAround: async (channelId, messageId, limit) => {
 			const around = await getChannelMessages(env, channelId, { around: messageId, limit });
