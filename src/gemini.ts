@@ -211,7 +211,7 @@ interface GenerateContentResponse {
 const fetchHistoryDeclaration = {
 	name: FETCH_HISTORY_FUNCTION,
 	description:
-		`Fetch up to ${TOOL_FETCH_LIMIT} messages from a channel already present in "channels". Given "message_id", centres the fetch on it (both before and after); omitted, fetches the channel's most recent messages instead. Use it to follow a reply chain, or to widen context around any message you already know about.`,
+		`Fetch up to ${TOOL_FETCH_LIMIT} messages from a channel already present in "channels", centred on "message_id" (both before and after). Use it to follow a reply chain, or to widen context around any message you already know about.`,
 	parameters: {
 		type: "object",
 		properties: {
@@ -230,7 +230,7 @@ const fetchHistoryDeclaration = {
 const searchWebDeclaration = {
 	name: SEARCH_WEB_FUNCTION,
 	description:
-		`Search the web for current or real-world information that "channels" doesn't have — news, recent events, facts you're unsure of. Searches are expensive, so only search when the answer genuinely depends on information you don't have; never for general knowledge you're confident in, or for casual conversation. Returns a few relevant pages with their text extracted. At most ${MAX_WEB_SEARCHES} searches per reply.`,
+		`Search the web for current or real-world information that "channels" doesn't have — news, recent events, facts you're unsure of. Searches are expensive, so only search when the answer genuinely depends on information you don't have; never for general knowledge you're confident in, or for casual conversation. Returns a few relevant pages with their text extracted. Keep each query to one topic; for several topics, make one call per topic in the same turn. At most ${MAX_WEB_SEARCHES} searches per reply.`,
 	parameters: {
 		type: "object",
 		properties: {
@@ -286,7 +286,7 @@ const sendReplyDeclaration = {
 				// <https://ai.google.dev/api/generate-content#schema>.
 				maxLength: String(MAX_REPLY_LENGTH),
 				description:
-					`Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages. For a line break, use an actual newline character — not the two-character sequence "\\n". Avoid mentioning tool names explicitly in the message. When relying on a web search result, cite its URL wrapped in angle brackets, like <https://example.com>, so Discord doesn't expand a preview of it.`,
+					`Your reply text. Must be at most ${MAX_REPLY_LENGTH} characters; Discord rejects longer messages.`,
 			},
 			replyToMessageId: {
 				type: "string",
@@ -306,7 +306,7 @@ function buildSystemInstruction(
 	canSearchWeb: boolean,
 ): { parts: Array<{ text: string }> } {
 	const lines = [
-		`You are "${bot.username}", a Discord bot with user id "${bot.id}". Every response must be a function call.`,
+		`You are "${bot.username}", a Discord bot with user id "${bot.id}".`,
 		`"trigger" is {"channelId", "messageId"} identifying the message that prompted this reply — look it up in "channels" for its content. That channel is the one you'll reply in; the remaining fields serve only as context.`,
 		isDirectMessage
 			? "This conversation is in a direct message — just you and the other person."
@@ -318,31 +318,40 @@ function buildSystemInstruction(
 		`Each message is {"id", "userId", "content", "date", "replyToId"}: "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${bot.id}" is one you sent.`,
 		`"users" maps every user id you might see — a message's "userId", or an id inside a raw "<@id>" or "<@!id>" mention token in "content" — to {"username", "globalName"}. Prefer "globalName" when it isn't null; otherwise use "username".`,
 		`A message may also have "attachments": ["filename", ...] for files or images it carries. You can't view them, but you can acknowledge them.`,
-		`A message may also have "editedDate" (ISO 8601) if it's been edited since it was first sent. There's no way to see what it originally said, so don't guess at the change — just be aware it happened.`,
-		`A message may also have "forwarded": {"content", "date", "origin"?, "editedDate"?, "attachments"?} — its author forwarded someone else's message instead of writing it, so the message's own "content" is only what they added alongside, usually nothing, and "forwarded.content" is the text they forwarded. You don't know who wrote it. "origin" is {"channelId", "messageId"} locating the original, which you can look up in "channels" if it's there.`,
-		`A message with "notice": {"kind", "origin"?} is one Discord posted itself, which is why its "content" is empty: "pinned" means "userId" pinned a message, "threadStarted" means "userId" started a thread from one (someone else may have written it). Either way "origin" is {"channelId", "messageId"} for the message it's about — look it up in "channels" if it's there.`,
+		`A message may also have "editedDate" (ISO 8601) if it's been edited; its original text isn't available.`,
+		`A message may also have "forwarded": {"content", "date", "origin"?, "editedDate"?, "attachments"?} — its author forwarded a message whose original author you can't see: "forwarded.content" is that text, and the message's own "content" is only what they added, usually nothing.`,
+		`A message with "notice": {"kind", "origin"?} is one Discord posted itself, so its "content" is empty: "pinned" means "userId" pinned a message, "threadStarted" means "userId" started a thread from one (someone else may have written it).`,
+		`For "forwarded" and "notice" alike, "origin" is {"channelId", "messageId"} of the message they point at — look it up in "channels" if it's there.`,
 	];
 
 	// Counts down per call, so the model is told what it actually has left.
 	// At 0, only send_reply may be called (see callGemini).
-	let guidance: string;
+	const guidance: string[] = [];
 	if (gatherTurnsLeft > 0) {
-		const budget =
+		guidance.push(`If "channels" isn't enough to answer, call ${FETCH_HISTORY_FUNCTION} — e.g. on a replyToId you want to see.`);
+		if (canSearchWeb) {
+			guidance.push(`If answering needs current or real-world information you don't reliably know, call ${SEARCH_WEB_FUNCTION}.`);
+		}
+		guidance.push(
 			gatherTurnsLeft === 1
 				? "This is your last turn to gather context."
-				: `You have ${gatherTurnsLeft} turns left to gather context.`;
-		const search = canSearchWeb
-			? ` If answering needs current or real-world information you don't reliably know, call ${SEARCH_WEB_FUNCTION}.`
-			: "";
-		guidance = `If "channels" isn't enough to answer, call ${FETCH_HISTORY_FUNCTION} — e.g. on a replyToId you want to see.${search} ${budget} Then answer with ${SEND_REPLY_FUNCTION}. Reply naturally and concisely.`;
+				: `You have ${gatherTurnsLeft} turns left to gather context.`,
+		);
+		guidance.push(`Then answer with ${SEND_REPLY_FUNCTION}.`);
 	} else {
-		guidance = `Answer now with ${SEND_REPLY_FUNCTION}. Reply naturally and concisely.`;
+		guidance.push(`Answer now with ${SEND_REPLY_FUNCTION}.`);
 	}
+	guidance.push("Reply naturally and concisely.");
+	guidance.push(`For a line break, use an actual newline character — not the two-character sequence "\\n".`);
+	guidance.push("Don't mention tool names.");
+	guidance.push(
+		"When relying on a web search result, cite its URL wrapped in angle brackets, like <https://example.com>, so Discord doesn't expand a preview of it.",
+	);
 
 	return {
 		parts: [
 			{ text: lines.join("\n") },
-			{ text: guidance },
+			{ text: guidance.join(" ") },
 		],
 	};
 }
