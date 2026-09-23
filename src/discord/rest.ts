@@ -168,20 +168,12 @@ export function getGatewayBot(env: Env): Promise<GatewayBot> {
 	return discordJson<GatewayBot>(env, "GET", "/gateway/bot");
 }
 
-/**
- * Fetches the bot's own user id/username via REST, independent of the Gateway's READY dispatch
- * (which a RESUME never re-sends) — so identity is resolvable even for a session that only ever
- * resumes.
- */
+/** Fetches the bot's own user. */
 export function getCurrentUser(env: Env): Promise<DiscordUser> {
 	return discordJson<DiscordUser>(env, "GET", "/users/@me");
 }
 
-/**
- * Posts a message to a channel as the bot, optionally as a reply to an earlier message. Content
- * over Discord's 2000-character limit is rejected by Discord; keeping replies short is the model's
- * job (see gemini.ts's system instruction), and a rejection surfaces as a failed send.
- */
+/** Posts a message to a channel as the bot, optionally as a reply to an earlier message. */
 export async function sendMessage(
 	env: Env,
 	channelId: string,
@@ -214,7 +206,7 @@ export async function triggerTyping(env: Env, channelId: string): Promise<void> 
 }
 
 /**
- * Fetches a channel's metadata — used to give Gemini the channel's name/topic for context.
+ * Fetches a channel's metadata.
  * Observed rate-limit bucket: 1000 per 0.001s.
  */
 export function getChannel(env: Env, channelId: string): Promise<DiscordChannel> {
@@ -222,7 +214,7 @@ export function getChannel(env: Env, channelId: string): Promise<DiscordChannel>
 }
 
 /**
- * Fetches a guild's metadata — used to give Gemini the guild's name/description for context.
+ * Fetches a guild's metadata.
  * Observed rate-limit bucket: 1000 per 0.001s.
  */
 export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {

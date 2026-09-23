@@ -20,7 +20,7 @@ const SEED_FETCH_LIMIT = 50;
 const TOOL_FETCH_LIMIT = 20;
 /** Caps how many links (and a forward's origin) in a single trigger get resolved, so a link-spammed message can't turn into an unbounded fan-out of fetches. */
 const MAX_MESSAGE_LINKS = 3;
-/** Caps `search_web` calls per reply, bounding Brave usage the way MAX_MESSAGE_LINKS bounds link fan-out. */
+/** Caps `search_web` calls per reply, bounding search usage the way MAX_MESSAGE_LINKS bounds link fan-out. */
 const MAX_WEB_SEARCHES = 3;
 /**
  * Discord's hard cap on message content. Not enforced locally: the model is asked to stay within it,
@@ -117,7 +117,7 @@ export interface ChannelInfo {
 export interface WebSearchResult {
 	url: string;
 	title: string;
-	/** Text extracted from the page, relevant to the query. May be plain text or JSON-serialized structured data (e.g. a table). */
+	/** Text extracted from the page, relevant to the query. */
 	snippets: string[];
 	/** ISO 8601 — the page's published or last-modified date. Omitted when the page has none known. */
 	date?: string;
@@ -549,13 +549,12 @@ export async function generateReply(
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
 
 	const trailContent: Content[] = [];
-	// Counts attempts, failures included, since each one is a Brave request.
+	// Counts attempts, failures included, since each one is a search request.
 	let webSearchCount = 0;
 	// Tracks every (channel, anchor) pair already fetched, so a repeat request — model-issued or a
 	// coincidental rediscovery of a seed fetch — is skipped rather than costing another round-trip.
-	// Channel-scoped even though a real message id alone would already be globally unique (Discord
-	// snowflakes never collide across channels), since a null anchor ("most recent messages") isn't:
-	// "most recent in channel A" and "most recent in channel B" are different requests.
+	// Keyed by channel as well as anchor: a null anchor ("most recent messages") means something
+	// different in each channel.
 	const fetchKey = (channelId: string, messageId: string | null) => `${channelId}:${messageId ?? ""}`;
 	const fetchedAnchors = new Set<string>([fetchKey(trigger.channelId, trigger.id)]);
 	// The message a forward or a notice points at is resolved exactly like a link in the content: same

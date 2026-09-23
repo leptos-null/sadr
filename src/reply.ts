@@ -164,14 +164,15 @@ export async function replyToMessage(env: Env, bot: BotIdentity, message: Messag
 
 /** The Discord reads `generateReply` makes while replying to `message`, message-link permission check included. */
 function createDiscordReader(env: Env, message: MessageCreateDispatchData): DiscordReader {
-	// All three caches are scoped to this one reply, so nothing is assumed fresh across replies, and
-	// hold the in-flight promise rather than the settled value: the permission checks run
-	// concurrently, and caching only settled values would let them all race past an empty
-	// cache. memberCache: links into the same guild look the asker up once. channelCache: the
-	// permission check and generateReply's channel-info fetch share one REST call per channel.
-	// guildCache: every channel in one guild — usually all of them — resolves it once.
+	// All three caches are scoped to this one reply, so nothing is assumed fresh across replies. Each
+	// holds the in-flight promise, not the settled value, so concurrent permission checks can't all
+	// race past an empty cache.
+
+	// Links into one guild look the asker up once.
 	const memberCache = new Map<string, Promise<DiscordGuildMember | null>>();
+	// Shared by the permission check and generateReply's channel-info fetch.
 	const channelCache = new Map<string, Promise<DiscordChannel>>();
+	// Every channel in one guild — usually all of them — resolves it once.
 	const guildCache = new Map<string, Promise<DiscordGuild>>();
 	const getChannelCached = (channelId: string): Promise<DiscordChannel> => {
 		let channelPromise = channelCache.get(channelId);
