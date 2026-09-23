@@ -17,14 +17,6 @@ interface LlmContextSource {
 	hostname: string;
 	/** [full date, YYYY-MM-DD, relative age, ISO 8601], or empty when the page has no known date. */
 	age: string[];
-	/** The page's own description, independent of the query. Only with `enable_source_metadata`. */
-	description?: string;
-	/** Only with `enable_source_metadata`. */
-	site_name?: string;
-	/** Favicon URL. Only with `enable_source_metadata`. */
-	favicon?: string;
-	/** Only with `enable_source_metadata`. */
-	thumbnail?: { src: string; original: string } | null;
 }
 
 /** <https://api-dashboard.search.brave.com/documentation/services/llm-context#response-format> */
