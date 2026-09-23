@@ -1,3 +1,4 @@
+import { searchWeb } from "./brave";
 import {
 	DiscordApiError,
 	getChannel,
@@ -134,7 +135,13 @@ function toGuildInfo(guildId: string, guild: DiscordGuild): { id: string } & Gui
 export async function replyToMessage(env: Env, bot: BotIdentity, message: MessageCreateDispatchData): Promise<void> {
 	const stopTyping = startTyping(env, message.channel_id);
 	try {
-		const reply = await generateReply(env, bot, toHistoryMessage(message), createDiscordReader(env, message));
+		const reply = await generateReply(
+			env,
+			bot,
+			toHistoryMessage(message),
+			createDiscordReader(env, message),
+			(query) => searchWeb(env, query),
+		);
 		console.log({ message: "Reply generated, sending to channel", channelId: message.channel_id });
 		await sendMessage(env, message.channel_id, reply.content, reply.replyToMessageId);
 	} catch (error) {

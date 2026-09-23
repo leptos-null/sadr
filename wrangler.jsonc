@@ -27,7 +27,7 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#secrets-configuration-property
 	 */
 	"secrets": {
-		"required": ["DISCORD_TOKEN", "GEMINI_API_KEY"]
+		"required": ["DISCORD_TOKEN", "GEMINI_API_KEY", "BRAVE_SEARCH_API_KEY"]
 	},
 	/**
 	 * Cron Triggers

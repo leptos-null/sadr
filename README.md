@@ -40,13 +40,17 @@ Whether you're running locally or deploying to Cloudflare, you'll need the follo
 2. Gemini API
     1. It's technically fine to re-use the same API key between a local instance and a deployment. You may choose to use separate keys for organization or security.
     2. If you don't yet have one, create a Gemini API key: [Google guide](<https://ai.google.dev/gemini-api/docs>)
+3. Brave Search API
+    1. As with Gemini, the same key can be re-used between a local instance and a deployment.
+    2. If you don't yet have one, create a Brave Search API key (the "Search" plan includes the LLM Context endpoint this bot uses): [Brave Search API](<https://brave.com/search/api/>)
 
 ### Local
 
-1. Place the 2 secrets from the steps above in `.dev.vars`:
+1. Place the 3 secrets from the steps above in `.dev.vars`:
     ```txt
     DISCORD_TOKEN=""
     GEMINI_API_KEY=""
+    BRAVE_SEARCH_API_KEY=""
     ```
     - You may also choose to add the line
         ```txt
@@ -70,10 +74,11 @@ Whether you're running locally or deploying to Cloudflare, you'll need the follo
 
 ### Deploying
 
-1. Provide the 2 secrets from the shared steps above to Cloudflare:
+1. Provide the 3 secrets from the shared steps above to Cloudflare:
     ```bash
     wrangler secret put DISCORD_TOKEN
     wrangler secret put GEMINI_API_KEY
+    wrangler secret put BRAVE_SEARCH_API_KEY
     ```
     - Each of these commands will interactively prompt you to input the value for the secret
 2. Deploy:

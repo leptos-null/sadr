@@ -1,6 +1,6 @@
 import { env } from "cloudflare:test";
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { generateReply, type BotIdentity, type ChannelInfo, type GuildInfo, type HistoryMessage, type UserInfo } from "../src/gemini";
+import { generateReply, type BotIdentity, type ChannelInfo, type GuildInfo, type HistoryMessage, type UserInfo, type WebSearchResult } from "../src/gemini";
 
 const BOT_USER_ID = "999";
 const BOT_USERNAME = "sadr-bot";
@@ -85,6 +85,8 @@ const fetchChannel = () => Promise.resolve<ChannelInfo | null>(CHANNEL);
 // Most tests either have no links in "trigger" (so this never gets called) or aren't testing access
 // control — default to "allowed" so they don't have to think about it.
 const canReadLinkedChannel = () => Promise.resolve(true);
+// Only the search_web tests look at what a search returns.
+const searchWeb = () => Promise.resolve<WebSearchResult[]>([]);
 
 function textResponse(text: string): Response {
 	return new Response(JSON.stringify({ candidates: [{ content: { role: "model", parts: [{ text }] } }] }), {
@@ -118,14 +120,14 @@ describe("generateReply", () => {
 		vi.restoreAllMocks();
 	});
 
-	it("sends both tools and returns the answer once the model calls send_reply", async () => {
+	it("sends every tool and returns the answer once the model calls send_reply", async () => {
 		env.GEMINI_API_KEY = "test-gemini-key";
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// The automatic seed fetch around the trigger, not a model-issued call.
@@ -141,6 +143,7 @@ describe("generateReply", () => {
 		const body = JSON.parse(init?.body as string);
 		expect(body.tools[0].functionDeclarations.map((declaration: { name: string }) => declaration.name)).toEqual([
 			"fetch_message_history",
+			"search_web",
 			"send_reply",
 		]);
 		expect(body.toolConfig.functionCallingConfig.mode).toBe("ANY");
@@ -166,7 +169,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([withAttachment]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const { messages } = JSON.parse(body.contents[0].parts[0].text).channels[HOME_CHANNEL_ID];
@@ -182,7 +185,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([edited]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const { messages } = JSON.parse(body.contents[0].parts[0].text).channels[HOME_CHANNEL_ID];
@@ -201,7 +204,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, withMention, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, withMention, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const { users } = JSON.parse(body.contents[0].parts[0].text);
@@ -215,7 +218,7 @@ describe("generateReply", () => {
 		const noTopic: ChannelInfo = { name: "general", topic: null, guild: CHANNEL.guild };
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel: () => Promise.resolve(noTopic), fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel: () => Promise.resolve(noTopic), fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const channel = JSON.parse(body.contents[0].parts[0].text).channels[HOME_CHANNEL_ID];
@@ -228,7 +231,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel: () => Promise.resolve(null), fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel: () => Promise.resolve(null), fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const channel = JSON.parse(body.contents[0].parts[0].text).channels[HOME_CHANNEL_ID];
@@ -242,7 +245,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const fetchChannelSpy = vi.fn().mockResolvedValue(CHANNEL);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel: fetchChannelSpy, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel: fetchChannelSpy, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchChannelSpy).toHaveBeenCalledTimes(1);
 	});
@@ -253,7 +256,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -285,7 +288,7 @@ describe("generateReply", () => {
 			fetchChannel: fetchChannelByGuild,
 			fetchAround,
 			canReadLinkedChannel,
-		});
+		}, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -308,7 +311,7 @@ describe("generateReply", () => {
 			fetchChannel: () => Promise.resolve(null),
 			fetchAround,
 			canReadLinkedChannel,
-		});
+		}, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		expect(body.systemInstruction.parts[0].text).toContain("in a Discord server");
@@ -326,7 +329,7 @@ describe("generateReply", () => {
 			fetchChannel: () => Promise.resolve(null),
 			fetchAround,
 			canReadLinkedChannel,
-		});
+		}, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		expect(body.systemInstruction.parts[0].text).toContain("direct message — just you");
@@ -347,7 +350,7 @@ describe("generateReply", () => {
 		};
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		expect(fetchAround).toHaveBeenCalledTimes(1);
@@ -366,7 +369,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, replyTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, replyTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
 		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, replyTrigger.id, 50);
@@ -389,7 +392,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn().mockResolvedValue([replyTarget]);
 
-		await generateReply(env, BOT, replyTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, replyTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// Only the trigger's own seed fetch — "42" already came back in that window, so the
 		// second round-trip is skipped entirely.
@@ -416,7 +419,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [linked] : []));
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// Resolved from the link's own channel, not the trigger's.
 		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
@@ -453,7 +456,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [original] : []));
 
-		await generateReply(env, BOT, forwardTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, forwardTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
@@ -483,7 +486,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [pinned] : []));
 
-		await generateReply(env, BOT, noticeTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, noticeTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "777", 10);
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
@@ -507,7 +510,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const denyAll = () => Promise.resolve(false);
 
-		await generateReply(env, BOT, forwardTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll });
+		await generateReply(env, BOT, forwardTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll }, searchWeb);
 
 		// Only the trigger's own seed fetch: the origin is gated exactly like a link the asker can't read.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
@@ -531,7 +534,7 @@ describe("generateReply", () => {
 		// deleted out from under the link.
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -565,7 +568,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [linked] : []));
 
-		const reply = await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// "777" is known, but from a different channel — Discord can't reply-quote across channels.
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
@@ -584,7 +587,7 @@ describe("generateReply", () => {
 			return [];
 		});
 
-		const reply = await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 	});
@@ -600,7 +603,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const denyAll = () => Promise.resolve(false);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll }, searchWeb);
 
 		// Only the trigger's own seed fetch — the link's channel/message fetches never happen at all.
 		expect(fetchAround).toHaveBeenCalledTimes(1);
@@ -624,7 +627,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const throwing = () => Promise.reject(new Error("503 Service Unavailable"));
 
-		const reply = await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: throwing });
+		const reply = await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: throwing }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		expect(errorSpy).toHaveBeenCalledTimes(1);
@@ -648,7 +651,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const denyAll = () => Promise.resolve(false);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll }, searchWeb);
 
 		// The model's request lands on the trigger's own channel instead — a real fetch, just redirected
 		// away from the denied one, not a dedup (the requested message_id "888" is still unknown).
@@ -671,7 +674,7 @@ describe("generateReply", () => {
 			return [];
 		});
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// A fetch error isn't a denial: the channel keeps its entry, and the model's own follow-up
 		// fetch goes to it rather than being redirected.
@@ -706,7 +709,7 @@ describe("generateReply", () => {
 			return [];
 		});
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// The failed seed never recorded its anchor, so the model's request for the same id is a
 		// real fetch — not skipped as an already-fetched anchor.
@@ -736,7 +739,7 @@ describe("generateReply", () => {
 			return messageId === "777" ? [linked] : [];
 		});
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -766,7 +769,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn(async (_channelId: string, messageId: string | null) => (messageId === "777" ? [linked] : []));
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel: failingFetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel: failingFetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// Only the name/topic is missing — the messages are still sent.
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
@@ -792,7 +795,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const denyAll = () => Promise.resolve(false);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: denyAll }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -815,7 +818,7 @@ describe("generateReply", () => {
 			fetchChannel,
 			fetchAround,
 			canReadLinkedChannel: throwingCheck,
-		});
+		}, searchWeb);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		expect(fetchAround).toHaveBeenCalledTimes(1); // just the trigger's own seed fetch
@@ -833,7 +836,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const canReadLinkedChannelSpy = vi.fn().mockResolvedValue(true);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: canReadLinkedChannelSpy });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: canReadLinkedChannelSpy }, searchWeb);
 
 		expect(canReadLinkedChannelSpy).toHaveBeenCalledWith(LINK_CHANNEL_ID, "555");
 	});
@@ -849,7 +852,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([]);
 		const canReadLinkedChannelSpy = vi.fn().mockResolvedValue(true);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: canReadLinkedChannelSpy });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel: canReadLinkedChannelSpy }, searchWeb);
 
 		// One permission check per channel, not per link — both links share LINK_CHANNEL_ID.
 		expect(canReadLinkedChannelSpy).toHaveBeenCalledTimes(1);
@@ -871,7 +874,7 @@ describe("generateReply", () => {
 			.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([already]);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -891,7 +894,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// The trigger's own seed fetch, plus at most 3 (MAX_MESSAGE_LINKS) of the 6 links.
 		expect(fetchAround).toHaveBeenCalledTimes(4);
@@ -909,7 +912,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "888", 20);
 	});
@@ -920,7 +923,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, "77", 20);
 	});
@@ -935,7 +938,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, linkTrigger, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// The trigger's own seed fetch, the link's own seed fetch (around "777"), and a third, distinct
 		// fetch for the model's own call — "most recent messages in that channel" isn't the same request
@@ -950,7 +953,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// Once for the automatic seed fetch; the model's own (redundant) request explicitly re-asking
 		// for the trigger's own id is deduped rather than fetched again.
@@ -963,7 +966,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// The automatic seed fetch (anchored on the trigger), plus a real second fetch for "the
 		// channel's most recent messages" — a different query from "around the trigger", so it isn't
@@ -990,7 +993,7 @@ describe("generateReply", () => {
 		// fetch of "77" brings "earlier" in — isolating what actually changes between the two calls.
 		const fetchAround = vi.fn((_channelId: string, anchor: string | null) => Promise.resolve(anchor === "77" ? [earlier] : []));
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const secondBody = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
 		// One plain "here's what's known" turn — no functionCall/functionResponse parts anywhere.
@@ -1015,7 +1018,7 @@ describe("generateReply", () => {
 		// Newest first, as Discord's Get Channel Messages returns them.
 		const fetchAround = vi.fn().mockResolvedValue([later, earlier]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
 		const payload = JSON.parse(body.contents[0].parts[0].text);
@@ -1032,7 +1035,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, "77", 20);
 	});
@@ -1043,7 +1046,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// Resolves to null (the channel's most recent messages), same as omitting the argument
 		// entirely — never fetched as the literal empty string.
@@ -1070,7 +1073,7 @@ describe("generateReply", () => {
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
 		const fetchSpy = vi.mocked(fetch);
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(fetchAround).toHaveBeenCalledTimes(2);
 		const thirdBody = JSON.parse(fetchSpy.mock.calls[2][1]?.body as string);
@@ -1086,7 +1089,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// The automatic seed fetch, plus one for "77" the first time it's asked for — the repeat is deduped.
 		expect(fetchAround).toHaveBeenCalledTimes(2);
@@ -1103,7 +1106,7 @@ describe("generateReply", () => {
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		// The automatic seed fetch, plus "77" and "88".
 		expect(fetchAround).toHaveBeenCalledTimes(3);
@@ -1120,7 +1123,7 @@ describe("generateReply", () => {
 		);
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
 		// Only the automatic seed fetch — send_reply wins outright, so the paired "77" fetch never runs.
@@ -1134,7 +1137,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: TRIGGER.id });
 	});
@@ -1145,7 +1148,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: null });
 	});
@@ -1165,7 +1168,7 @@ describe("generateReply", () => {
 		};
 		const fetchAround = vi.fn().mockResolvedValue([earlier]);
 
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply).toEqual({ content: "hi", replyToMessageId: "0" });
 	});
@@ -1176,40 +1179,44 @@ describe("generateReply", () => {
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow(/exceeded/);
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow(/exceeded/);
 
 		expect(fetchSpy).toHaveBeenCalledTimes(5); // MAX_GEMINI_CALLS
 	});
 
-	it("withholds fetch_message_history on the final call, forcing a conclusion", async () => {
+	it("allows only send_reply on the final call, forcing a conclusion, while keeping every tool declared", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 		const fetchAround = vi.fn().mockResolvedValue([]);
 
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow();
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow();
 
-		const finalCallBody = JSON.parse(fetchSpy.mock.calls[4][1]?.body as string);
-		expect(finalCallBody.tools[0].functionDeclarations.map((d: { name: string }) => d.name)).toEqual(["send_reply"]);
-		// The final-call system instruction shouldn't reference a tool it never declares.
-		const instructionText = finalCallBody.systemInstruction.parts.map((p: { text: string }) => p.text).join(" ");
-		expect(instructionText).not.toContain("fetch_message_history");
+		const bodyFor = (call: number) => JSON.parse(fetchSpy.mock.calls[call][1]?.body as string);
+		expect(bodyFor(3).toolConfig.functionCallingConfig).toEqual({ mode: "ANY" });
+		expect(bodyFor(4).toolConfig.functionCallingConfig).toEqual({ mode: "ANY", allowedFunctionNames: ["send_reply"] });
+		// Still declared, so an echoed search turn in the history never calls an undeclared function.
+		expect(bodyFor(4).tools[0].functionDeclarations.map((d: { name: string }) => d.name)).toEqual([
+			"fetch_message_history",
+			"search_web",
+			"send_reply",
+		]);
 	});
 
-	it("counts the gathering budget down per call, then drops it once the tool is withheld", async () => {
+	it("counts the gathering budget down per call, then drops it once only send_reply is allowed", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockImplementation(async () => functionCallResponse("fetch_message_history", {}));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow();
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow();
 
 		const instructionFor = (call: number) =>
 			JSON.parse(fetchSpy.mock.calls[call][1]?.body as string)
 				.systemInstruction.parts.map((part: { text: string }) => part.text)
 				.join(" ");
 
-		// Four gathering turns, not MAX_GEMINI_CALLS: the fifth call only offers send_reply.
+		// Four gathering turns, not MAX_GEMINI_CALLS: the fifth call only allows send_reply.
 		expect(instructionFor(0)).toContain("You have 4 turns left to gather context");
 		expect(instructionFor(2)).toContain("You have 2 turns left to gather context");
 		expect(instructionFor(3)).toContain("This is your last turn to gather context");
@@ -1217,11 +1224,138 @@ describe("generateReply", () => {
 		expect(instructionFor(4)).not.toContain("gather context");
 	});
 
+	it("echoes a search turn verbatim, signature included, followed by the search's results", async () => {
+		const result: WebSearchResult = {
+			url: "https://example.com/news",
+			title: "News",
+			snippets: ["Something happened today."],
+			date: "2026-09-22T12:00:00Z",
+		};
+		const searchParts = [
+			{ functionCall: { id: "call-1", name: "search_web", args: { query: " latest news " } }, thoughtSignature: "sig-a" },
+		];
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				new Response(JSON.stringify({ candidates: [{ content: { role: "model", parts: searchParts } }] }), { status: 200 }),
+			)
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const searchWebSpy = vi.fn().mockResolvedValue([result]);
+
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWebSpy);
+
+		expect(searchWebSpy).toHaveBeenCalledExactlyOnceWith("latest news");
+		const contents = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string).contents;
+		// The rebuilt payload still comes first, unchanged by the search.
+		expect(contents).toHaveLength(3);
+		expect(JSON.parse(contents[0].parts[0].text)).not.toHaveProperty("webSearches");
+		expect(contents[1]).toEqual({ role: "model", parts: searchParts });
+		expect(contents[2]).toEqual({
+			role: "user",
+			parts: [{ functionResponse: { id: "call-1", name: "search_web", response: { results: [result] } } }],
+		});
+	});
+
+	it("reports a failed search to the model as an error rather than failing the reply", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("search_web", { query: "q" }))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const searchWebSpy = vi.fn().mockRejectedValue(new Error("429"));
+		vi.spyOn(console, "error").mockImplementation(() => {});
+
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWebSpy);
+
+		expect(reply).toEqual({ content: "hi there", replyToMessageId: null });
+		const contents = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string).contents;
+		expect(contents[2].parts[0].functionResponse.response).toHaveProperty("error");
+	});
+
+	it("answers a fetch paired with a search in the same turn, and leaves a fetch-only turn out", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: "77" }))
+			.mockResolvedValueOnce(
+				multiCallResponse(
+					{ name: "fetch_message_history", args: { message_id: "78" } },
+					{ name: "search_web", args: { query: "q" } },
+				),
+			)
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
+
+		const contentsFor = (call: number) => JSON.parse(fetchSpy.mock.calls[call][1]?.body as string).contents;
+		expect(contentsFor(1)).toHaveLength(1);
+		const [, model, user] = contentsFor(2);
+		expect(model.parts.map((part: { functionCall: { name: string } }) => part.functionCall.name)).toEqual([
+			"fetch_message_history",
+			"search_web",
+		]);
+		expect(user.parts.map((part: { functionResponse: { name: string } }) => part.functionResponse.name)).toEqual([
+			"fetch_message_history",
+			"search_web",
+		]);
+	});
+
+	it("caps how many searches one reply can run, answering the rest with an error", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				multiCallResponse(
+					{ name: "search_web", args: { query: "a" } },
+					{ name: "search_web", args: { query: "b" } },
+					{ name: "search_web", args: { query: "c" } },
+					{ name: "search_web", args: { query: "d" } },
+				),
+			)
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+		const searchWebSpy = vi.fn().mockResolvedValue([]);
+		vi.spyOn(console, "warn").mockImplementation(() => {});
+
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWebSpy);
+
+		expect(searchWebSpy.mock.calls).toEqual([["a"], ["b"], ["c"]]); // MAX_WEB_SEARCHES
+		const responses = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string).contents[2].parts;
+		expect(responses[3].functionResponse.response).toHaveProperty("error");
+	});
+
+	it("stops allowing and suggesting search_web once the search cap is reached", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(
+				multiCallResponse(
+					{ name: "search_web", args: { query: "a" } },
+					{ name: "search_web", args: { query: "b" } },
+				),
+			)
+			.mockResolvedValueOnce(functionCallResponse("search_web", { query: "c" }))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const fetchAround = vi.fn().mockResolvedValue([]);
+
+		await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
+
+		const bodyFor = (call: number) => JSON.parse(fetchSpy.mock.calls[call][1]?.body as string);
+		const guidanceFor = (call: number) => bodyFor(call).systemInstruction.parts[1].text;
+		// One search left after the first turn, so it's still offered.
+		expect(bodyFor(1).toolConfig.functionCallingConfig).toEqual({ mode: "ANY" });
+		expect(guidanceFor(1)).toContain("search_web");
+		expect(bodyFor(2).toolConfig.functionCallingConfig).toEqual({
+			mode: "ANY",
+			allowedFunctionNames: ["fetch_message_history", "send_reply"],
+		});
+		expect(guidanceFor(2)).not.toContain("search_web");
+	});
+
 	it("throws when the model doesn't call a function", async () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(textResponse("no function call"));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow(
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow(
 			/didn't call a function/,
 		);
 	});
@@ -1230,7 +1364,7 @@ describe("generateReply", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(functionCallResponse("send_reply", { replyToMessageId: null }));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow(/without content/);
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow(/without content/);
 	});
 
 	it("treats whitespace-only content as no content, rather than letting Discord reject it", async () => {
@@ -1239,7 +1373,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow(/without content/);
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow(/without content/);
 	});
 
 	it("trims the reply content it returns", async () => {
@@ -1248,7 +1382,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel });
+		const reply = await generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb);
 
 		expect(reply.content).toBe("hi there");
 	});
@@ -1265,7 +1399,7 @@ describe("generateReply", () => {
 		);
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow(
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow(
 			/no content parts.*MAX_TOKENS.*SAFETY/,
 		);
 	});
@@ -1274,6 +1408,6 @@ describe("generateReply", () => {
 		vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response("bad key", { status: 403 }));
 
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel })).rejects.toThrow(/403/);
+		await expect(generateReply(env, BOT, TRIGGER, { isDirectMessage, fetchChannel, fetchAround, canReadLinkedChannel }, searchWeb)).rejects.toThrow(/403/);
 	});
 });
