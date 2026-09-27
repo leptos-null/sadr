@@ -194,6 +194,7 @@ interface GenerateContentRequest {
 	systemInstruction: { parts: Array<{ text: string }> };
 	tools: Array<{ functionDeclarations: unknown[] }>;
 	toolConfig: { functionCallingConfig: { mode: "ANY"; allowedFunctionNames?: string[] } };
+	generationConfig?: { thinkingConfig: { thinkingLevel: "minimal" | "low" | "medium" | "high" } };
 }
 
 interface UsageMetadata {
@@ -381,6 +382,14 @@ async function callGemini(
 		toolConfig: {
 			functionCallingConfig: { mode: "ANY", allowedFunctionNames },
 		},
+		// gemini-3.5-flash-lite `thinkingLevel` default is "minimal".
+		// increased to "low" primarily based on the findings in <https://contextarena.ai/>
+		// (which shows "low" nearly doubles the ability to track context versus "minimal").
+		// context following is particularly important for our usage because
+		//   1. the system instructions and tool descriptions include specific rules
+		//   2. the content heavily relies on IDs (user IDs, message IDs, etc.), which are effectively "needles" in the context
+		// in my sampling, context length is usually between 4k and 20k tokens (usually only extending above 8k when using web search).
+		generationConfig: { thinkingConfig: { thinkingLevel: "low" } },
 	};
 	debugLog(env, () => ({ message: "Gemini request", requestBody }));
 	const response = await fetch(`${API_BASE}/${MODEL}:generateContent`, {
