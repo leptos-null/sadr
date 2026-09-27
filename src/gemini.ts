@@ -564,11 +564,14 @@ export async function generateReply(
 	discord: DiscordReader,
 	searchWeb: WebSearcher,
 ): Promise<ReplyResult> {
+	const startedAt = Date.now();
 	const resolved = new Map<string, HistoryMessage>([[trigger.id, trigger]]);
 
 	const trailContent: Content[] = [];
 	// Counts attempts, failures included, since each one is a search request.
 	let webSearchCount = 0;
+	let historyFetchCount = 0;
+	let totalTokenCount = 0;
 	// Tracks every (channel, anchor) pair already fetched, so a repeat request — model-issued or a
 	// coincidental rediscovery of a seed fetch — is skipped rather than costing another round-trip.
 	// Keyed by channel as well as anchor: a null anchor ("most recent messages") means something
@@ -673,6 +676,7 @@ export async function generateReply(
 	for (let call = 0; call < MAX_GEMINI_CALLS; call++) {
 		// Hits 0 on the final call, which is what restricts the model to send_reply and forces a conclusion.
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
+		const callStartedAt = Date.now();
 		const geminiResponse = await callGemini(
 			env,
 			// in my testing, we're able to change the leading content (i.e. value from `buildContents`)
@@ -688,10 +692,12 @@ export async function generateReply(
 		console.log({
 			message: "Gemini call completed",
 			call,
+			durationMs: Date.now() - callStartedAt,
 			promptTokenCount: geminiResponse.usageMetadata?.promptTokenCount,
 			candidatesTokenCount: geminiResponse.usageMetadata?.candidatesTokenCount,
 			totalTokenCount: geminiResponse.usageMetadata?.totalTokenCount,
 		});
+		totalTokenCount += (geminiResponse.usageMetadata?.totalTokenCount ?? 0);
 
 		const responseCandidates = geminiResponse.candidates ?? [];
 		const candidateCount = responseCandidates.length;
@@ -725,7 +731,20 @@ export async function generateReply(
 		// send_reply ends the turn, so it wins outright if the model paired it with fetches.
 		const sendReply = functionCalls.find((functionCall) => functionCall.name === SEND_REPLY_FUNCTION);
 		if (sendReply) {
-			return toReplyResult(sendReply, resolved, trigger.channelId);
+			const result = toReplyResult(sendReply, resolved, trigger.channelId);
+			console.log({
+				message: "Gemini reply generated",
+				isDirectMessage: discord.isDirectMessage,
+				geminiCalls: call + 1,
+				webSearches: webSearchCount,
+				historyFetches: historyFetchCount,
+				totalTokenCount,
+				replyLength: result.content.length,
+				linkedChannels: channelIds.length - 1,
+				inaccessibleChannels: inaccessibleChannelIds.size,
+				durationMs: Date.now() - startedAt,
+			});
+			return result;
 		}
 
 		const functionResponses: ContentPart[] = [];
@@ -741,8 +760,16 @@ export async function generateReply(
 					response = { error: "No searches left for this reply." };
 				} else {
 					webSearchCount++;
+					const searchStartedAt = Date.now();
 					try {
-						response = { results: await searchWeb(query) };
+						const results = await searchWeb(query);
+						console.log({
+							message: "Gemini web search completed",
+							queryLength: query.length,
+							resultCount: results.length,
+							durationMs: Date.now() - searchStartedAt,
+						});
+						response = { results };
 					} catch (error) {
 						console.error({ message: "Gemini web search failed", query, error: errorMessage(error) }, error);
 						response = { error: "The search failed." };
@@ -762,6 +789,7 @@ export async function generateReply(
 					console.warn({ message: "Gemini re-requested an already-fetched anchor", channelId, messageId });
 				} else {
 					fetchedAnchors.add(key);
+					historyFetchCount++;
 					const around = await discord.fetchAround(channelId, messageId, TOOL_FETCH_LIMIT);
 					for (const message of around) {
 						resolved.set(message.id, message);

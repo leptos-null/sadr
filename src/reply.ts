@@ -142,7 +142,6 @@ export async function replyToMessage(env: Env, bot: BotIdentity, message: Messag
 			createDiscordReader(env, message),
 			(query) => searchWeb(env, query),
 		);
-		console.log({ message: "Reply generated, sending to channel", channelId: message.channel_id });
 		await sendMessage(env, message.channel_id, reply.content, reply.replyToMessageId);
 	} catch (error) {
 		// Whoever addressed the bot can't tell silence from "still thinking", so always say
