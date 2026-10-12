@@ -222,7 +222,7 @@ const SNOWFLAKE_PATTERN = "^[0-9]+$";
 const fetchHistoryDeclaration = {
 	name: FETCH_HISTORY_FUNCTION,
 	description:
-		`Fetch up to ${TOOL_FETCH_LIMIT} messages from a channel, centred on "message_id" (both before and after). Use it to follow a reply chain, or to widen context around any message you already know about.`,
+		`Fetch up to ${TOOL_FETCH_LIMIT} messages from a channel, centred on "message_id" (both before and after). Use it to follow a reply chain, or to see more of a conversation. Centring on a message in the middle of what "channels" already has returns nothing new; use the oldest or newest message there to go further.`,
 	parameters: {
 		type: "object",
 		properties: {
@@ -428,7 +428,7 @@ async function callGemini(
 	canSearchWeb: boolean,
 	features: PayloadFeatures,
 ): Promise<GenerateContentResponse> {
-	// Every tool stays declared, since an echoed search turn may call any of them; this only narrows
+	// Every tool stays declared, since an echoed turn may call any of them; this only narrows
 	// what the model may call next.
 	let allowedFunctionNames: string[] | undefined;
 	if (gatherTurnsLeft === 0) {
@@ -618,8 +618,9 @@ function toReplyResult(
  * `search_web` to look something up, and `send_reply` once ready. A channel it names that wasn't
  * seeded goes through that same check first. Every fetched message lands in one `resolved` map, and
  * each Gemini call gets a freshly rebuilt view of it (grouped by channel in `buildContents`) rather
- * than a growing transcript of past fetches. Searches are the exception: a turn that searched is kept
- * as an ordinary function-call transcript after that view.
+ * than a growing transcript of past fetches. Two kinds of turn are the exception, kept as an ordinary
+ * function-call transcript after that view: one that searched, and one that re-requested an anchor
+ * already fetched — the repeat changes nothing in the view, so the echo is the only sign it happened.
  */
 export async function generateReply(
 	env: Env,
@@ -828,9 +829,11 @@ export async function generateReply(
 		}
 
 		const functionResponses: ContentPart[] = [];
+		let shouldIncludeResponses = false;
 		for (const functionCall of functionCalls) {
 			let response: Record<string, unknown>;
 			if (functionCall.name === SEARCH_WEB_FUNCTION) {
+				shouldIncludeResponses = true;
 				const query = (functionCall.args?.query as string | undefined)?.trim();
 				if (!query) {
 					console.warn({ message: "Gemini called search_web without a query", functionCall });
@@ -893,6 +896,8 @@ export async function generateReply(
 					const key = fetchKey(channelId, messageId);
 					if (fetchedAnchors.has(key)) {
 						console.warn({ message: "Gemini re-requested an already-fetched anchor", channelId, messageId });
+						shouldIncludeResponses = true;
+						response = { error: `Already fetched: "channels" has everything this returns. Use a different "message_id" to see more.` };
 					} else {
 						fetchedAnchors.add(key);
 						historyFetchCount++;
@@ -900,9 +905,9 @@ export async function generateReply(
 						for (const message of around) {
 							resolved.set(message.id, message);
 						}
+						// The messages themselves reach the model through the rebuilt payload, not here.
+						response = { result: `Any messages found are now in "channels".` };
 					}
-					// The messages themselves reach the model through the rebuilt payload, not here.
-					response = { result: `Any messages found are now in "channels".` };
 				}
 			} else {
 				console.error({ message: "Gemini called an unknown function", functionCall });
@@ -910,11 +915,10 @@ export async function generateReply(
 			}
 			functionResponses.push({ functionResponse: { id: functionCall.id, name: functionCall.name, response } });
 		}
-		// `FETCH_HISTORY_FUNCTION` edits the context directly, so we don't need to add
-		// its responses into `trailContent`. If at least 1 function call needs to be appended
-		// here, they all do though, since the "signature" applies to an entire turn, not just
-		// a single function (see `ContentPart.thoughtSignature`).
-		if (functionCalls.some((functionCall) => functionCall.name === SEARCH_WEB_FUNCTION)) {
+		// If at least 1 function call needs to be appended here, they all do, since
+		// the "signature" applies to an entire turn, not just a single function
+		// (see `ContentPart.thoughtSignature`).
+		if (shouldIncludeResponses) {
 			trailContent.push({ role: "model", parts }, { role: "user", parts: functionResponses });
 		}
 	}

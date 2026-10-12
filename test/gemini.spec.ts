@@ -1138,6 +1138,27 @@ describe("generateReply", () => {
 		expect(fetchAround).toHaveBeenCalledTimes(1);
 	});
 
+	it("echoes a turn that re-requested an already-fetched anchor, so the model can see the repeat", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { message_id: TRIGGER.id }))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+
+		await replyTo(TRIGGER);
+
+		// The rebuilt payload, then the model's own turn and the response to it.
+		const body = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
+		expect(body.contents).toHaveLength(3);
+		expect(body.contents[1]).toEqual({
+			role: "model",
+			parts: [{ functionCall: { name: "fetch_message_history", args: { message_id: TRIGGER.id } } }],
+		});
+		expect(body.contents[2].parts[0].functionResponse).toMatchObject({
+			name: "fetch_message_history",
+			response: { error: expect.stringContaining("Already fetched") },
+		});
+	});
+
 	it("treats an omitted message_id as a genuinely new request, not a fallback to the trigger", async () => {
 		vi.spyOn(globalThis, "fetch")
 			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
