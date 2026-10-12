@@ -785,7 +785,7 @@ describe("generateReply", () => {
 		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ inaccessible: true });
 	});
 
-	it("falls back to the trigger's own channel rather than retrying a model-issued fetch for a denied link", async () => {
+	it("neither fetches nor re-checks when the model requests a denied link's channel", async () => {
 		const linkTrigger: HistoryMessage = {
 			...TRIGGER,
 			content: `what's this? https://discord.com/channels/999/${LINK_CHANNEL_ID}/777`,
@@ -796,14 +796,13 @@ describe("generateReply", () => {
 			)
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
-		const denyAll = () => Promise.resolve(false);
+		const denyAll = vi.fn().mockResolvedValue(false);
 
 		await replyTo(linkTrigger, { fetchAround, canReadLinkedChannel: denyAll });
 
-		// The model's request lands on the trigger's own channel instead — a real fetch, just redirected
-		// away from the denied one, not a dedup (the requested message_id "888" is still unknown).
-		expect(fetchAround).not.toHaveBeenCalledWith(LINK_CHANNEL_ID, "888", 20);
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, "888", 20);
+		// Only the trigger's own seed fetch: the request isn't redirected to another channel either.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		expect(denyAll).toHaveBeenCalledTimes(1);
 	});
 
 	it("keeps a channel accessible, and still reachable, when a link's message fetch fails", async () => {
@@ -1056,15 +1055,55 @@ describe("generateReply", () => {
 		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "888", 20);
 	});
 
-	it("falls back to the trigger's own channel when the model's channel_id isn't one already known", async () => {
-		vi.spyOn(globalThis, "fetch")
-			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { channel_id: "some-other-channel", message_id: "77" }))
+	it("checks a channel the model names for the first time, then fetches from it", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { channel_id: LINK_CHANNEL_ID, message_id: "77" }))
+			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+		const linked: HistoryMessage = { ...TRIGGER, id: "77", channelId: LINK_CHANNEL_ID, content: "from the linked channel" };
+		const fetchAround = vi.fn(async (channelId: string) => (channelId === LINK_CHANNEL_ID ? [linked] : []));
+		const canReadLinkedChannelSpy = vi.fn().mockResolvedValue(true);
+
+		await replyTo(TRIGGER, { fetchAround, canReadLinkedChannel: canReadLinkedChannelSpy });
+
+		expect(canReadLinkedChannelSpy).toHaveBeenCalledWith(LINK_CHANNEL_ID, TRIGGER.userId);
+		expect(fetchAround).toHaveBeenCalledWith(LINK_CHANNEL_ID, "77", 20);
+		const body = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({
+			name: CHANNEL.name,
+			topic: CHANNEL.topic,
+			guildId: GUILD_ID,
+			messages: [payloadMessage(linked)],
+		});
+	});
+
+	it("marks a channel the model names inaccessible when the check denies it, without fetching", async () => {
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockResolvedValueOnce(functionCallResponse("fetch_message_history", { channel_id: LINK_CHANNEL_ID, message_id: "77" }))
 			.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
 		const fetchAround = vi.fn().mockResolvedValue([]);
+		const fetchChannelSpy = vi.fn().mockResolvedValue(CHANNEL);
 
-		await replyTo(TRIGGER, { fetchAround });
+		await replyTo(TRIGGER, { fetchAround, fetchChannel: fetchChannelSpy, canReadLinkedChannel: () => Promise.resolve(false) });
 
-		expect(fetchAround).toHaveBeenCalledWith(HOME_CHANNEL_ID, "77", 20);
+		// Only the trigger's own channel: nothing about the denied one is fetched.
+		expect(fetchAround).toHaveBeenCalledTimes(1);
+		expect(fetchChannelSpy).toHaveBeenCalledTimes(1);
+		const body = JSON.parse(fetchSpy.mock.calls[1][1]?.body as string);
+		const payload = JSON.parse(body.contents[0].parts[0].text);
+		expect(payload.channels[LINK_CHANNEL_ID]).toEqual({ inaccessible: true });
+	});
+
+	it("throws on a channel_id that would change the Discord REST path, before any check or fetch", async () => {
+		vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+			functionCallResponse("fetch_message_history", { channel_id: `${LINK_CHANNEL_ID}/messages?limit=1` }),
+		);
+		const canReadLinkedChannelSpy = vi.fn().mockResolvedValue(true);
+
+		await expect(replyTo(TRIGGER, { canReadLinkedChannel: canReadLinkedChannelSpy })).rejects.toThrow("malformed channel_id");
+		expect(canReadLinkedChannelSpy).not.toHaveBeenCalled();
 	});
 
 	it("omitting message_id for a known channel fetches that channel's most recent messages, not a re-fetch of the link", async () => {

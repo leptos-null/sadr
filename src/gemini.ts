@@ -45,7 +45,7 @@ export interface UserInfo {
 export interface ForwardedMessage {
 	/**
 	 * Where the original lives. Resolved like a message link when this is the trigger's own forward
-	 * (see `generateReply`); on a message from history it's an unresolved label.
+	 * (see `generateReply`); on a message from history it stays unresolved unless the model fetches it.
 	 */
 	origin?: MessageLink;
 	content: string;
@@ -213,20 +213,28 @@ interface GenerateContentResponse {
 	usageMetadata?: UsageMetadata;
 }
 
+/**
+ * A Discord snowflake: a uint64, always serialized as a decimal string, per
+ * <https://docs.discord.com/developers/reference#snowflakes>.
+ */
+const SNOWFLAKE_PATTERN = "^[0-9]+$";
+
 const fetchHistoryDeclaration = {
 	name: FETCH_HISTORY_FUNCTION,
 	description:
-		`Fetch up to ${TOOL_FETCH_LIMIT} messages from a channel already present in "channels", centred on "message_id" (both before and after). Use it to follow a reply chain, or to widen context around any message you already know about.`,
+		`Fetch up to ${TOOL_FETCH_LIMIT} messages from a channel, centred on "message_id" (both before and after). Use it to follow a reply chain, or to widen context around any message you already know about.`,
 	parameters: {
 		type: "object",
 		properties: {
 			channel_id: {
 				type: "string",
-				description: `Which channel (a key of "channels") to search. Omit to use "trigger.channelId".`,
+				pattern: SNOWFLAKE_PATTERN,
+				description: `The ID of the channel to fetch from. Omit to use "trigger.channelId".`,
 			},
 			message_id: {
 				type: "string",
-				description: `An id from that channel's "messages" to centre the fetch on. Omit to fetch the channel's most recent messages instead.`,
+				pattern: SNOWFLAKE_PATTERN,
+				description: "The message to centre the fetch on. Omit to fetch the channel's most recent messages instead.",
 			},
 		},
 	},
@@ -607,10 +615,11 @@ function toReplyResult(
  * model's only way to see them.
  *
  * From there the model can call `fetch_message_history` for more context in any accessible channel,
- * `search_web` to look something up, and `send_reply` once ready. Every fetched message lands in one
- * `resolved` map, and each Gemini call gets a freshly rebuilt view of it (grouped by channel in
- * `buildContents`) rather than a growing transcript of past fetches. Searches are the exception: a
- * turn that searched is kept as an ordinary function-call transcript after that view.
+ * `search_web` to look something up, and `send_reply` once ready. A channel it names that wasn't
+ * seeded goes through that same check first. Every fetched message lands in one `resolved` map, and
+ * each Gemini call gets a freshly rebuilt view of it (grouped by channel in `buildContents`) rather
+ * than a growing transcript of past fetches. Searches are the exception: a turn that searched is kept
+ * as an ordinary function-call transcript after that view.
  */
 export async function generateReply(
 	env: Env,
@@ -671,6 +680,7 @@ export async function generateReply(
 	// The trigger's own channel is never in here, since it skips the check above.
 	const inaccessibleChannelIds = new Set(channelChecks.filter((check) => !check.allowed).map((check) => check.channelId));
 	const allowedLinks = candidateLinks.filter((link) => allowedChannelIds.has(link.channelId));
+	// Grows when a model-issued fetch names a new channel that passes the same check (see the loop below).
 	const channelIds = [...new Set([trigger.channelId, ...allowedChannelIds])];
 
 	// Neither kind of failure here fails the whole reply — it only leaves out what that fetch would have
@@ -846,27 +856,54 @@ export async function generateReply(
 					}
 				}
 			} else if (functionCall.name === FETCH_HISTORY_FUNCTION) {
-				// Only an accessible channel already in "channels" is reachable; anything else (hallucinated,
-				// unknown, inaccessible) falls back to the trigger's own channel.
-				const requestedChannelId = functionCall.args?.channel_id as string | undefined;
-				const channelId =
-					requestedChannelId && channelIds.includes(requestedChannelId) ? requestedChannelId : trigger.channelId;
-				// `|| null`, not `??`: an empty string is treated as omitted, since Discord's `around` needs a real id.
+				// `||`, not `??`, for both: an empty string is treated as omitted.
+				const channelId = (functionCall.args?.channel_id as string | undefined) || trigger.channelId;
 				const messageId = (functionCall.args?.message_id as string | undefined) || null;
-				// Re-fetching the same (channel, anchor) pair can only return what's already in `resolved`.
-				const key = fetchKey(channelId, messageId);
-				if (fetchedAnchors.has(key)) {
-					console.warn({ message: "Gemini re-requested an already-fetched anchor", channelId, messageId });
-				} else {
-					fetchedAnchors.add(key);
-					historyFetchCount++;
-					const around = await discord.fetchAround(channelId, messageId, TOOL_FETCH_LIMIT);
-					for (const message of around) {
-						resolved.set(message.id, message);
+				// A last resort behind the schema's `pattern`: `channel_id` goes into a Discord REST path as
+				// is. `message_id` needs no such check, since it's query-encoded on its way out.
+				if (/[?/]/.test(channelId)) {
+					throw new Error(`Gemini called ${FETCH_HISTORY_FUNCTION} with a malformed channel_id: ${JSON.stringify(channelId)}`);
+				}
+				// A channel not in "channels" yet (e.g. from a link in a message other than the trigger) goes
+				// through the same check as a link in the trigger, and joins "channels" either way.
+				if (!channelIds.includes(channelId) && !inaccessibleChannelIds.has(channelId)) {
+					const isAllowed = await discord.canReadLinkedChannel(channelId, trigger.userId).catch((error) => {
+						console.error(
+							{ message: "Gemini message-link permission check failed, treating as denied", channelId, error: errorMessage(error) },
+							error,
+						);
+						return false;
+					});
+					if (isAllowed) {
+						channelIds.push(channelId);
+						try {
+							channelInfoById.set(channelId, await discord.fetchChannel(channelId));
+						} catch (error) {
+							console.error({ message: "Gemini failed to fetch channel", channelId, error: errorMessage(error) }, error);
+							channelInfoById.set(channelId, null);
+						}
+					} else {
+						inaccessibleChannelIds.add(channelId);
 					}
 				}
-				// The messages themselves reach the model through the rebuilt payload, not here.
-				response = { result: `Any messages found are now in "channels".` };
+				if (inaccessibleChannelIds.has(channelId)) {
+					response = { error: "That channel is inaccessible." };
+				} else {
+					// Re-fetching the same (channel, anchor) pair can only return what's already in `resolved`.
+					const key = fetchKey(channelId, messageId);
+					if (fetchedAnchors.has(key)) {
+						console.warn({ message: "Gemini re-requested an already-fetched anchor", channelId, messageId });
+					} else {
+						fetchedAnchors.add(key);
+						historyFetchCount++;
+						const around = await discord.fetchAround(channelId, messageId, TOOL_FETCH_LIMIT);
+						for (const message of around) {
+							resolved.set(message.id, message);
+						}
+					}
+					// The messages themselves reach the model through the rebuilt payload, not here.
+					response = { result: `Any messages found are now in "channels".` };
+				}
 			} else {
 				console.error({ message: "Gemini called an unknown function", functionCall });
 				response = { error: `Unknown function "${functionCall.name}".` };
