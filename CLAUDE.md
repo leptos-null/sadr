@@ -12,12 +12,12 @@ Package manager is **bun** (`bun.lock` is the lockfile — don't use npm/yarn).
   - single file: `bun run test test/gemini.spec.ts`
   - single test: `bun run test -t "test name"`
 - `bun run typecheck` — typechecks `src/` and `test/` as two separate programs: `test/tsconfig.json` adds the `cloudflare:test` types, which the root config deliberately leaves out so `src/` can't typecheck against a test-only module. A plain `bunx tsc --noEmit` checks `src/` only.
-- `bun run cf-typegen` — `wrangler types`; **re-run after any binding/secret change in `wrangler.jsonc`** to regenerate `worker-configuration.d.ts`
+- `bun run cf-typegen` — `wrangler types`; **re-run after any binding/secret change in `wrangler.jsonc`** to regenerate `worker-configuration.d.ts`, and mirror any binding/DO change into `test/wrangler.jsonc` (below) so the test runtime doesn't diverge from production
 - `bun run deploy` — `wrangler deploy`
 
 ### Local dev gotchas
 
-- Secrets (`DISCORD_TOKEN`, `GEMINI_API_KEY`, `BRAVE_SEARCH_API_KEY`) come from a git-ignored `.dev.vars` in the repo root, not `wrangler.jsonc`.
+- Secrets (`DISCORD_TOKEN`, `GEMINI_API_KEY`, `BRAVE_SEARCH_API_KEY`) come from a git-ignored `.dev.vars` in the repo root, not `wrangler.jsonc`. Tests deliberately don't read it: wrangler loads `.dev.vars` from the directory of the config it's given, and `@cloudflare/vitest-plugin` has no way to skip that, so `vitest.config.mts` points at `test/wrangler.jsonc` (same Worker shape, placeholder tokens) instead. That keeps real secrets out of the test runtime, and lets the suite run in a sandbox that denies `.dev.vars`.
 - Nothing auto-triggers the bot's Gateway connection in local dev. Hit `curl localhost:8787` once after starting `wrangler dev` to fire `ensureConnected()`. The cron (`scheduled` handler) doesn't run locally either — trigger it manually with `curl "http://localhost:8787/cdn-cgi/local/scheduled"` if you need to test the self-heal path.
 - Running `wrangler dev` / `vitest` may need a local loopback listener that a process sandbox can block (`EPERM` on `listen`) — that's an environment restriction, not an app bug.
 - Per Cloudflare's known issues, DO alarm methods (the primary keep-alive loop — see `discord-gateway.ts`'s `alarm()`) can silently fail after a hot reload in `wrangler dev` (i.e. after editing code while it's running). If the bot seems to stop reconnecting after a local code edit, restart `wrangler dev` before assuming it's an app bug.

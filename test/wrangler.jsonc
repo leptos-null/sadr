@@ -1,0 +1,29 @@
+/**
+ * Wrangler config for the test runtime only (see vitest.config.mts).
+ *
+ * Wrangler reads `.dev.vars` from the directory of the config file it's given, so pointing the tests
+ * at the root `wrangler.jsonc` makes every test run load the real secrets. Tests never need them
+ * (each sets the token it uses, and outbound requests are mocked), so this config lives one
+ * directory down and supplies placeholders instead.
+ *
+ * Keep the Worker's shape (`exports`, `durable_objects`, `compatibility_date`) in step with the
+ * root `wrangler.jsonc`.
+ */
+{
+	"$schema": "../node_modules/wrangler/config-schema.json",
+	"name": "sadr",
+	"main": "../src/index.ts",
+	"compatibility_date": "2026-09-03",
+	"exports": {
+		"DiscordGateway": { "type": "durable-object", "storage": "sqlite" }
+	},
+	"durable_objects": {
+		"bindings": [{ "name": "DISCORD_GATEWAY", "class_name": "DiscordGateway" }]
+	},
+	"vars": {
+		"LOG_LEVEL": "info",
+		"DISCORD_TOKEN": "test-discord-token",
+		"GEMINI_API_KEY": "test-gemini-key",
+		"BRAVE_SEARCH_API_KEY": "test-brave-key"
+	}
+}
