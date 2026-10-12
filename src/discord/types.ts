@@ -71,6 +71,8 @@ export interface DiscordGuild {
 	name: string;
 	/** Always present in the payload, though frequently null when no description is set. */
 	description: string | null;
+	/** Only present when requested with `with_counts` (see `getGuild`). */
+	approximate_member_count?: number;
 }
 
 /** <https://docs.discord.com/developers/resources/guild#guild-member-object>; only the fields this bot reads. */

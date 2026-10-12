@@ -330,6 +330,41 @@ describe("generateReply", () => {
 		expect(body.systemInstruction.parts[0].text).toContain("direct message — just you");
 	});
 
+	describe("large-server rules", () => {
+		const LARGE_SERVER_TEXT = "This is a large public server.";
+
+		async function guidanceFor(reader: Partial<DiscordReader>): Promise<string> {
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+			await replyTo(TRIGGER, reader);
+			return JSON.parse(fetchSpy.mock.calls[0][1]?.body as string).systemInstruction.parts[1].text;
+		}
+
+		const channelWithMembers = (guildMemberCount?: number) => () =>
+			Promise.resolve<ChannelInfo | null>({ ...CHANNEL, guildMemberCount });
+
+		it("applies above the member threshold", async () => {
+			expect(await guidanceFor({ fetchChannel: channelWithMembers(101) })).toContain(LARGE_SERVER_TEXT);
+		});
+
+		it("is skipped at or below the member threshold", async () => {
+			expect(await guidanceFor({ fetchChannel: channelWithMembers(100) })).not.toContain(LARGE_SERVER_TEXT);
+		});
+
+		it("applies when Discord reported no member count", async () => {
+			expect(await guidanceFor({ fetchChannel: channelWithMembers(undefined) })).toContain(LARGE_SERVER_TEXT);
+		});
+
+		it("applies when the channel details couldn't be loaded", async () => {
+			expect(await guidanceFor({ fetchChannel: () => Promise.resolve(null) })).toContain(LARGE_SERVER_TEXT);
+		});
+
+		it("never applies in a DM", async () => {
+			expect(await guidanceFor({ isDirectMessage: true, fetchChannel: () => Promise.resolve(null) })).not.toContain(LARGE_SERVER_TEXT);
+		});
+	});
+
 	it("seeds context around the trigger before asking the model anything", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")

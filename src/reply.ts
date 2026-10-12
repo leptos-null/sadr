@@ -119,8 +119,8 @@ export function toHistoryMessage(message: DiscordMessage): HistoryMessage {
 }
 
 /** As `toHistoryMessage`, for the channel metadata Gemini is given. */
-function toChannelInfo(channel: DiscordChannel, guild: ChannelInfo["guild"]): ChannelInfo {
-	return { name: channel.name ?? null, topic: channel.topic ?? null, guild };
+function toChannelInfo(channel: DiscordChannel, guild: ChannelInfo["guild"], guildMemberCount: number | undefined): ChannelInfo {
+	return { name: channel.name ?? null, topic: channel.topic ?? null, guild, guildMemberCount };
 }
 
 /** As `toHistoryMessage`, for the guild metadata Gemini is given — the id comes from the channel that named it. */
@@ -215,8 +215,11 @@ function createDiscordReader(env: Env, message: MessageCreateDispatchData): Disc
 			const channel = await getChannelCached(channelId);
 			// The channel's own guild_id, never the trigger's: a linked channel can be in another guild
 			// (and a link's URL doesn't say which — see MessageLink).
-			const guild = channel.guild_id ? toGuildInfo(channel.guild_id, await getGuildCached(channel.guild_id)) : null;
-			return toChannelInfo(channel, guild);
+			if (!channel.guild_id) {
+				return toChannelInfo(channel, null, undefined);
+			}
+			const guild = await getGuildCached(channel.guild_id);
+			return toChannelInfo(channel, toGuildInfo(channel.guild_id, guild), guild.approximate_member_count);
 		},
 		fetchAround: async (channelId, messageId, limit) => {
 			const around = await getChannelMessages(env, channelId, { around: messageId, limit });

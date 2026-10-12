@@ -214,11 +214,11 @@ export function getChannel(env: Env, channelId: string): Promise<DiscordChannel>
 }
 
 /**
- * Fetches a guild's metadata.
+ * Fetches a guild's metadata, `approximate_member_count` included.
  * Observed rate-limit bucket: 1000 per 0.001s.
  */
 export function getGuild(env: Env, guildId: string): Promise<DiscordGuild> {
-	return discordJson<DiscordGuild>(env, "GET", `/guilds/${guildId}`);
+	return discordJson<DiscordGuild>(env, "GET", `/guilds/${guildId}?with_counts=true`);
 }
 
 /**
