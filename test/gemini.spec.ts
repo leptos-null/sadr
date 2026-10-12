@@ -365,6 +365,124 @@ describe("generateReply", () => {
 		});
 	});
 
+	describe("payload-dependent instructions", () => {
+		const DM_READER: Partial<DiscordReader> = { isDirectMessage: true, fetchChannel: () => Promise.resolve(null) };
+		const GUILDS_LINE = `"guilds" maps`;
+		const OTHER_CHANNELS_LINE = `Any other "channels" entry`;
+		const INACCESSIBLE_LINE = `{"inaccessible": true}`;
+		const FORWARDED_LINE = `"forwarded": {`;
+		const NOTICE_LINE = `"notice": {`;
+		const ORIGIN_LINE = `"origin" is {"channelId", "messageId"}`;
+		const CITATION_LINE = "cite its URL";
+
+		const forwardMessage: HistoryMessage = {
+			...TRIGGER,
+			id: "2",
+			forwarded: { content: "forwarded text", date: "2023-12-31T00:00:00.000Z" },
+		};
+		const noticeMessage: HistoryMessage = { ...TRIGGER, id: "3", content: "", notice: { kind: "pinned" } };
+		const linkTrigger: HistoryMessage = {
+			...TRIGGER,
+			content: `what's this? https://discord.com/channels/999/${LINK_CHANNEL_ID}/777`,
+		};
+
+		/** The static half of the system instruction on the first (only) request of a reply that answers at once. */
+		async function instructionOf(trigger: HistoryMessage, reader: Partial<DiscordReader> = {}): Promise<string> {
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValue(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+			await replyTo(trigger, reader);
+			return JSON.parse(fetchSpy.mock.calls[0][1]?.body as string).systemInstruction.parts[0].text;
+		}
+
+		it("describes none of the optional parts when a DM's payload has none of them", async () => {
+			const instruction = await instructionOf(TRIGGER, DM_READER);
+
+			for (const line of [GUILDS_LINE, OTHER_CHANNELS_LINE, INACCESSIBLE_LINE, FORWARDED_LINE, NOTICE_LINE, ORIGIN_LINE]) {
+				expect(instruction).not.toContain(line);
+			}
+		});
+
+		it("describes guilds when a channel belongs to one", async () => {
+			expect(await instructionOf(TRIGGER)).toContain(GUILDS_LINE);
+		});
+
+		it("describes guilds in a DM that links into a guild's channel", async () => {
+			const instruction = await instructionOf(linkTrigger, {
+				isDirectMessage: true,
+				fetchChannel: (channelId) => Promise.resolve(channelId === HOME_CHANNEL_ID ? null : CHANNEL),
+			});
+
+			expect(instruction).toContain(GUILDS_LINE);
+		});
+
+		it("omits other channels when the trigger's is the only one", async () => {
+			expect(await instructionOf(TRIGGER)).not.toContain(OTHER_CHANNELS_LINE);
+		});
+
+		it("describes other channels when a link brings one in", async () => {
+			expect(await instructionOf(linkTrigger)).toContain(OTHER_CHANNELS_LINE);
+		});
+
+		it("omits inaccessible channels when none was denied", async () => {
+			expect(await instructionOf(linkTrigger)).not.toContain(INACCESSIBLE_LINE);
+		});
+
+		it("describes inaccessible channels when one was denied", async () => {
+			const instruction = await instructionOf(linkTrigger, { canReadLinkedChannel: () => Promise.resolve(false) });
+
+			expect(instruction).toContain(INACCESSIBLE_LINE);
+			// A denied channel is still another channel, even though nothing about it was fetched.
+			expect(instruction).toContain(OTHER_CHANNELS_LINE);
+		});
+
+		it("describes forwards, and where they point, when the trigger is a forward", async () => {
+			const instruction = await instructionOf(forwardMessage);
+
+			expect(instruction).toContain(FORWARDED_LINE);
+			expect(instruction).toContain(ORIGIN_LINE);
+			expect(instruction).not.toContain(NOTICE_LINE);
+		});
+
+		it("describes notices, and where they point, when a message is a notice", async () => {
+			const instruction = await instructionOf(noticeMessage);
+
+			expect(instruction).toContain(NOTICE_LINE);
+			expect(instruction).toContain(ORIGIN_LINE);
+			expect(instruction).not.toContain(FORWARDED_LINE);
+		});
+
+		it("starts describing a forward on the call after a fetch brings one in", async () => {
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValueOnce(functionCallResponse("fetch_message_history", {}))
+				.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+			// The seed fetch finds nothing; the model's own fetch finds the forward.
+			const fetchAround = vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce([forwardMessage]);
+
+			await replyTo(TRIGGER, { fetchAround });
+
+			const instructionFor = (call: number) =>
+				JSON.parse(fetchSpy.mock.calls[call][1]?.body as string).systemInstruction.parts[0].text;
+			expect(instructionFor(0)).not.toContain(FORWARDED_LINE);
+			expect(instructionFor(1)).toContain(FORWARDED_LINE);
+		});
+
+		it("asks for search results to be cited only once a search has run", async () => {
+			const fetchSpy = vi
+				.spyOn(globalThis, "fetch")
+				.mockResolvedValueOnce(functionCallResponse("search_web", { query: "weather" }))
+				.mockResolvedValueOnce(functionCallResponse("send_reply", { content: "hi there", replyToMessageId: null }));
+
+			await replyTo(TRIGGER);
+
+			const guidanceFor = (call: number) =>
+				JSON.parse(fetchSpy.mock.calls[call][1]?.body as string).systemInstruction.parts[1].text;
+			expect(guidanceFor(0)).not.toContain(CITATION_LINE);
+			expect(guidanceFor(1)).toContain(CITATION_LINE);
+		});
+	});
+
 	it("seeds context around the trigger before asking the model anything", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
@@ -1336,7 +1454,7 @@ describe("generateReply", () => {
 		expect(responses[3].functionResponse.response).toHaveProperty("error");
 	});
 
-	it("stops allowing and suggesting search_web once the search cap is reached", async () => {
+	it("stops allowing search_web once the search cap is reached", async () => {
 		const fetchSpy = vi
 			.spyOn(globalThis, "fetch")
 			.mockResolvedValueOnce(
@@ -1351,15 +1469,12 @@ describe("generateReply", () => {
 		await replyTo(TRIGGER);
 
 		const bodyFor = (call: number) => JSON.parse(fetchSpy.mock.calls[call][1]?.body as string);
-		const guidanceFor = (call: number) => bodyFor(call).systemInstruction.parts[1].text;
 		// One search left after the first turn, so it's still offered.
 		expect(bodyFor(1).toolConfig.functionCallingConfig).toEqual({ mode: "ANY" });
-		expect(guidanceFor(1)).toContain("search_web");
 		expect(bodyFor(2).toolConfig.functionCallingConfig).toEqual({
 			mode: "ANY",
 			allowedFunctionNames: ["fetch_message_history", "send_reply"],
 		});
-		expect(guidanceFor(2)).not.toContain("search_web");
 	});
 
 	it("throws when the model doesn't call a function", async () => {

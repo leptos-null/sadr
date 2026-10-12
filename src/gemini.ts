@@ -297,19 +297,35 @@ const sendReplyDeclaration = {
 				type: "string",
 				nullable: true,
 				description:
-					`An id from "trigger.channelId"'s messages (in "channels") to quote, when it isn't obvious which message you're answering — Discord renders your reply attached to it. Null to not attach to any message. An id not from that channel, or not in "messages" there, is ignored.`,
+					`An id from "trigger.channelId"'s messages (in "channels") to quote, when it isn't obvious which message you're answering — Discord renders your reply attached to it. Null to not attach to any message.`,
 			},
 		},
 		required: ["content", "replyToMessageId"],
 	},
 };
 
+/**
+ * What the current payload actually contains, so `buildSystemInstruction` describes only that.
+ * Recomputed every call: a model-issued fetch can bring in a forward or a notice that wasn't there before.
+ */
+interface PayloadFeatures {
+	/** Some channel belongs to a guild, so `guilds` isn't empty. */
+	hasGuilds: boolean;
+	/** `channels` holds an entry besides the trigger's own, accessible or not. */
+	hasOtherChannels: boolean;
+	hasInaccessibleChannels: boolean;
+	hasForwards: boolean;
+	hasNotices: boolean;
+	/** A search has run, so the transcript carries results the reply may cite. */
+	hasSearchResults: boolean;
+}
+
 function buildSystemInstruction(
 	bot: BotIdentity,
 	isDirectMessage: boolean,
 	isLargeServer: boolean,
 	gatherTurnsLeft: number,
-	canSearchWeb: boolean,
+	features: PayloadFeatures,
 ): { parts: Array<{ text: string }> } {
 	const lines = [
 		`You are "${bot.username}", a Discord bot with user id "${bot.id}".`,
@@ -318,32 +334,53 @@ function buildSystemInstruction(
 			? "This conversation is in a direct message — just you and the other person."
 			: `This conversation is in a Discord server; "guildId" on "trigger"'s channel says which one.`,
 		'"channels" maps a Discord channel id to {"name", "topic", "guildId", "messages"}: "messages" is every message you currently know from that channel, oldest first, including "trigger" itself.',
-		`"guilds" maps a Discord server id to {"name", "description"}; a channel's "guildId" is the server it belongs to, and is null for a direct message or when that channel's details couldn't be loaded.`,
-		`Any other "channels" entry is a different channel with its own separate conversation, possibly in a different server — don't assume shared context with it, and you can't reply-quote a message from it.`,
-		`A "channels" entry can also be just {"inaccessible": true} — access to it was denied, so no name/topic/messages are available for it. Don't call ${FETCH_HISTORY_FUNCTION} on it again, and don't guess at what it might contain.`,
+	];
+	if (features.hasGuilds) {
+		lines.push(
+			`"guilds" maps a Discord server id to {"name", "description"}; a channel's "guildId" is the server it belongs to, and is null for a direct message or when that channel's details couldn't be loaded.`,
+		);
+	}
+	if (features.hasOtherChannels) {
+		lines.push(
+			`Any other "channels" entry is a different channel with its own separate conversation, possibly in a different server — don't assume shared context with it, and you can't reply-quote a message from it.`,
+		);
+	}
+	if (features.hasInaccessibleChannels) {
+		lines.push(
+			`A "channels" entry can also be just {"inaccessible": true} — access to it was denied, so no name/topic/messages are available for it. Don't call ${FETCH_HISTORY_FUNCTION} on it again, and don't guess at what it might contain.`,
+		);
+	}
+	lines.push(
 		`Each message is {"id", "userId", "content", "date", "replyToId"}: "date" is ISO 8601, and "replyToId" is the id of the message it replies to, or null if the message is not a reply. A message whose "userId" is "${bot.id}" is one you sent.`,
 		`"users" maps every user id you might see — a message's "userId", or an id inside a raw "<@id>" or "<@!id>" mention token in "content" — to {"username", "globalName"}. Prefer "globalName" when it isn't null; otherwise use "username".`,
 		`A message may also have "attachments": ["filename", ...] for files or images it carries. You can't view them, but you can acknowledge them.`,
 		`A message may also have "editedDate" (ISO 8601) if it's been edited; its original text isn't available.`,
-		`A message may also have "forwarded": {"content", "date", "origin"?, "editedDate"?, "attachments"?} — its author forwarded a message whose original author you can't see: "forwarded.content" is that text, and the message's own "content" is only what they added, usually nothing.`,
-		`A message with "notice": {"kind", "origin"?} is one Discord posted itself, so its "content" is empty: "pinned" means "userId" pinned a message, "threadStarted" means "userId" started a thread from one (someone else may have written it).`,
-		`For "forwarded" and "notice" alike, "origin" is {"channelId", "messageId"} of the message they point at — look it up in "channels" if it's there.`,
-	];
+	);
+	if (features.hasForwards) {
+		lines.push(
+			`A message may also have "forwarded": {"content", "date", "origin"?, "editedDate"?, "attachments"?} — its author forwarded a message whose original author you can't see: "forwarded.content" is that text, and the message's own "content" is only what they added, usually nothing.`,
+		);
+	}
+	if (features.hasNotices) {
+		lines.push(
+			`A message with "notice": {"kind", "origin"?} is one Discord posted itself, so its "content" is empty: "pinned" means "userId" pinned a message, "threadStarted" means "userId" started a thread from one (someone else may have written it).`,
+		);
+	}
+	if (features.hasForwards || features.hasNotices) {
+		lines.push(
+			`"origin" is {"channelId", "messageId"} of the message a forward or notice points at — look it up in "channels" if it's there.`,
+		);
+	}
 
 	// Counts down per call, so the model is told what it actually has left.
 	// At 0, only send_reply may be called (see callGemini).
 	const guidance: string[] = [];
 	if (gatherTurnsLeft > 0) {
-		guidance.push(`If "channels" isn't enough to answer, call ${FETCH_HISTORY_FUNCTION} — e.g. on a replyToId you want to see.`);
-		if (canSearchWeb) {
-			guidance.push(`If answering needs current or real-world information you don't reliably know, call ${SEARCH_WEB_FUNCTION}.`);
-		}
 		guidance.push(
 			gatherTurnsLeft === 1
-				? "This is your last turn to gather context."
-				: `You have ${gatherTurnsLeft} turns left to gather context.`,
+				? `This is your last turn to gather context, then answer with ${SEND_REPLY_FUNCTION}.`
+				: `You have ${gatherTurnsLeft} turns left to gather context, then answer with ${SEND_REPLY_FUNCTION}.`,
 		);
-		guidance.push(`Then answer with ${SEND_REPLY_FUNCTION}.`);
 	} else {
 		guidance.push(`Answer now with ${SEND_REPLY_FUNCTION}.`);
 	}
@@ -359,9 +396,11 @@ function buildSystemInstruction(
 	guidance.push("Reply naturally and concisely.");
 	guidance.push(`For a line break, use an actual newline character — not the two-character sequence "\\n".`);
 	guidance.push("Don't mention tool names.");
-	guidance.push(
-		"When relying on a web search result, cite its URL wrapped in angle brackets, like <https://example.com>, so Discord doesn't expand a preview of it.",
-	);
+	if (features.hasSearchResults) {
+		guidance.push(
+			"When relying on a web search result, cite its URL wrapped in angle brackets, like <https://example.com>, so Discord doesn't expand a preview of it.",
+		);
+	}
 
 	return {
 		parts: [
@@ -379,6 +418,7 @@ async function callGemini(
 	isLargeServer: boolean,
 	gatherTurnsLeft: number,
 	canSearchWeb: boolean,
+	features: PayloadFeatures,
 ): Promise<GenerateContentResponse> {
 	// Every tool stays declared, since an echoed search turn may call any of them; this only narrows
 	// what the model may call next.
@@ -390,7 +430,7 @@ async function callGemini(
 	}
 	const requestBody: GenerateContentRequest = {
 		contents,
-		systemInstruction: buildSystemInstruction(bot, isDirectMessage, isLargeServer, gatherTurnsLeft, canSearchWeb),
+		systemInstruction: buildSystemInstruction(bot, isDirectMessage, isLargeServer, gatherTurnsLeft, features),
 		tools: [
 			{ functionDeclarations: [fetchHistoryDeclaration, searchWebDeclaration, sendReplyDeclaration] },
 		],
@@ -696,6 +736,15 @@ export async function generateReply(
 		// Hits 0 on the final call, which is what restricts the model to send_reply and forces a conclusion.
 		const gatherTurnsLeft = MAX_GEMINI_CALLS - 1 - call;
 		const callStartedAt = Date.now();
+		const messages = [...resolved.values()];
+		const features: PayloadFeatures = {
+			hasGuilds: [...channelInfoById.values()].some((info) => info?.guild),
+			hasOtherChannels: channelInfoById.size + inaccessibleChannelIds.size > 1,
+			hasInaccessibleChannels: inaccessibleChannelIds.size > 0,
+			hasForwards: messages.some((message) => message.forwarded),
+			hasNotices: messages.some((message) => message.notice),
+			hasSearchResults: webSearchCount > 0,
+		};
 		const geminiResponse = await callGemini(
 			env,
 			// in my testing, we're able to change the leading content (i.e. value from `buildContents`)
@@ -707,6 +756,7 @@ export async function generateReply(
 			gatherTurnsLeft,
 			// The in-loop cap check still applies: one turn can make several searches at once.
 			webSearchCount < MAX_WEB_SEARCHES,
+			features,
 		);
 
 		console.log({
