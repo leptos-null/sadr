@@ -22,6 +22,7 @@ import {
 	type DiscordUser,
 } from "./discord/types";
 import {
+	GeminiApiError,
 	generateReply,
 	type BotIdentity,
 	type ChannelInfo,
@@ -40,6 +41,9 @@ const TYPING_REFRESH_MS = 8_000;
 
 /** Sent to the user when generating or delivering a real reply failed — silence is worse. */
 const FALLBACK_REPLY = "Sorry — something went wrong while I was working on a reply. Mind trying again?";
+
+/** As `FALLBACK_REPLY`, for Gemini answering `UNAVAILABLE`: the model is overloaded, which is common and usually brief. */
+const OVERLOADED_REPLY = "Sorry — the AI model I rely on is overloaded right now. This usually clears up quickly, so try again in a moment.";
 
 /** As `toHistoryMessage`, for a single Discord user's name info. */
 function toUserInfo(user: DiscordUser): UserInfo {
@@ -130,7 +134,7 @@ function toGuildInfo(guildId: string, guild: DiscordGuild): { id: string } & Gui
 
 /**
  * Generates a reply to `message` — already known to be addressed to `bot` — and posts it, with the
- * typing indicator up meanwhile. Never throws: any failure posts FALLBACK_REPLY instead.
+ * typing indicator up meanwhile. Never throws: any failure posts a fallback reply instead.
  */
 export async function replyToMessage(env: Env, bot: BotIdentity, message: MessageCreateDispatchData): Promise<void> {
 	const stopTyping = startTyping(env, message.channel_id);
@@ -150,7 +154,8 @@ export async function replyToMessage(env: Env, bot: BotIdentity, message: Messag
 			{ message: "Reply failed, sending fallback", messageId: message.id, error: errorMessage(error) },
 			error,
 		);
-		await sendMessage(env, message.channel_id, FALLBACK_REPLY, message.id).catch((fallbackError) =>
+		const fallback = error instanceof GeminiApiError && error.body?.status === "UNAVAILABLE" ? OVERLOADED_REPLY : FALLBACK_REPLY;
+		await sendMessage(env, message.channel_id, fallback, message.id).catch((fallbackError) =>
 			console.error(
 				{ message: "Reply fallback also failed", error: errorMessage(fallbackError) },
 				fallbackError,

@@ -34,6 +34,37 @@ const FETCH_HISTORY_FUNCTION = "fetch_message_history";
 const SEARCH_WEB_FUNCTION = "search_web";
 const SEND_REPLY_FUNCTION = "send_reply";
 
+/**
+ * The `google.rpc.Status` Gemini returns inside a non-2xx response. The Gemini API's `Status` schema
+ * marks every field optional; `status` isn't in that schema but is on real responses (verified live),
+ * and its values are listed in https://ai.google.dev/gemini-api/docs/troubleshooting.
+ */
+export interface GeminiErrorStatus {
+	/** The HTTP status code, e.g. 503. */
+	code?: number;
+	/** A developer-facing message, in English. */
+	message?: string;
+	/** The canonical name of `code`, e.g. `"UNAVAILABLE"`. */
+	status?: string;
+	/** Typed detail messages, each tagged with its own `@type`. */
+	details?: Array<Record<string, unknown>>;
+}
+
+/**
+ * A non-2xx Gemini response. `body` is the response body's `error`, or null when the body
+ * didn't have one (a proxy's HTML error page, say); `message` carries the response text either way.
+ */
+export class GeminiApiError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+		readonly body: GeminiErrorStatus | null,
+	) {
+		super(message);
+		this.name = "GeminiApiError";
+	}
+}
+
 /** A user's name info, as given to Gemini via the shared `users` map rather than repeated per message. */
 export interface UserInfo {
 	username: string;
@@ -467,7 +498,15 @@ async function callGemini(
 		signal: AbortSignal.timeout(60_000),
 	});
 	if (!response.ok) {
-		throw new Error(`Gemini generateContent failed: ${response.status} ${await response.text()}`);
+		const text = await response.text();
+		let body: GeminiErrorStatus | null = null;
+		try {
+			const parsed = JSON.parse(text) as { error?: GeminiErrorStatus } | null;
+			body = parsed?.error ?? null;
+		} catch {
+			// Not JSON (e.g. a proxy's error page); the text still goes in the message below.
+		}
+		throw new GeminiApiError(response.status, `Gemini generateContent failed: ${response.status} ${text}`, body);
 	}
 	const data = (await response.json()) as GenerateContentResponse;
 	debugLog(env, () => ({ message: "Gemini response", data }));
