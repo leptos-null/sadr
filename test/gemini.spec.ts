@@ -331,7 +331,7 @@ describe("generateReply", () => {
 	});
 
 	describe("large-server rules", () => {
-		const LARGE_SERVER_TEXT = "This is a large public server.";
+		const LARGE_SERVER_TEXT = "Stay plain, neutral, and on-task";
 
 		async function guidanceFor(reader: Partial<DiscordReader>): Promise<string> {
 			const fetchSpy = vi
@@ -405,6 +405,13 @@ describe("generateReply", () => {
 
 		it("describes guilds when a channel belongs to one", async () => {
 			expect(await instructionOf(TRIGGER)).toContain(GUILDS_LINE);
+		});
+
+		it("still explains a null guildId when a server channel's details couldn't be loaded", async () => {
+			const instruction = await instructionOf(TRIGGER, { fetchChannel: () => Promise.resolve(null) });
+
+			expect(instruction).not.toContain(GUILDS_LINE);
+			expect(instruction).toContain(`"guildId" is null for a direct message or when that channel's details couldn't be loaded.`);
 		});
 
 		it("describes guilds in a DM that links into a guild's channel", async () => {
